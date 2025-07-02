@@ -9,6 +9,12 @@ To run the evaluation code, you need to install the required dependencies. You c
 pip install -r requirements.txt
 ```
 
+# Obtaining the Model File
+
+Sadly, we don't have the rights to add the SMPL-X skeleton to this repository. Therefore, you will have to obtain a .glb file of the smplx skeleton yourself. \
+For this install the [smplx blender addon](https://github.com/Meshcapade/SMPL_blender_addon) in blender, press on the "add" button in the Blender SMPL-X drawer. \
+Finally, go to File -> Export -> glTF 2.0 and follow the export dialog to save your .glb file. \
+
 # Running the Evaluation
 To run the evaluation, you can use the following command:
 
