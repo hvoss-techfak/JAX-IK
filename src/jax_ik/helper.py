@@ -59,7 +59,7 @@ def load_skeleton_from_gltf(gltf_file):
         node = gltf.nodes[node_index]
         bone_name = node.name if node.name is not None else f"bone_{node_index}"
         local_transform = get_node_transform(node)
-        print(f"Node {node_index}: {bone_name} - Local Transform:\n{local_transform}")
+        #print(f"Node {node_index}: {bone_name} - Local Transform:\n{local_transform}")
         bone = {
             "name": bone_name,
             "local_transform": local_transform,

@@ -66,7 +66,6 @@ right_hand_bones = {
 
 left_arm_bounds_dict = {
     "left_collar": ([-10, -10, -10], [10, 10, 10]),
-    #"left_collar": ([-70, -45, -15], [20, 45, 10]),
     "left_shoulder": ([-120, -140, -65], [70, 50, 25]),
     "left_elbow": ([-100, -180, -10], [90, 10, 10]),
     "left_wrist": ([-120, -70, -70], [90, 60, 80]),

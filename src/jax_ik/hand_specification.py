@@ -1,7 +1,7 @@
 import numpy as np
 
-from IK_SMPLX_Statics import get_pointing_pose, get_shaping_pose, get_flat_pose
-from IK_objectives_jax import InitPoseObj, BoneDirectionObjective
+from jax_ik.smplx_statics import get_pointing_pose, get_shaping_pose, get_flat_pose
+from jax_ik.objectives import InitPoseObj, BoneDirectionObjective
 
 
 def getPoseMask(pose_dict, controlled_bones):

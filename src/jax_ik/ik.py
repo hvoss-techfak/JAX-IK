@@ -12,12 +12,12 @@ from jax.tree_util import register_pytree_node_class
 import pyvista as pv
 from tqdm import tqdm
 
-from IK_Helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf
+from jax_ik.helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf
 
 
-from IK_Helper import load_skeleton_from_gltf, load_skeleton_from_urdf
+from jax_ik.helper import load_skeleton_from_gltf, load_skeleton_from_urdf
 
-from IK_objectives_jax import (
+from jax_ik.objectives import (
     DistanceObjTraj,
     ObjectiveFunction, BoneZeroRotationObj,
 )

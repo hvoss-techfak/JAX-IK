@@ -14,15 +14,15 @@ import numpy as np
 import pyvista as pv
 
 # --- Local Imports ---
-from TF_JAX_IK.IK_Helper import (
+from jax_ik.helper import (
     deform_mesh,
     load_mesh_data_from_gltf,
     load_mesh_data_from_urdf,
 )
-from IK_Hand_Specification import HandSpecification
-from IK_SMPLX_Statics import left_arm_bounds_dict, right_arm_bounds_dict, complete_full_body_bounds_dict
-from IK_jax import InverseKinematicsSolver
-from IK_objectives_jax import (
+from jax_ik.hand_specification import HandSpecification
+from jax_ik.smplx_statics import left_arm_bounds_dict, right_arm_bounds_dict, complete_full_body_bounds_dict
+from jax_ik.ik import InverseKinematicsSolver
+from jax_ik.objectives import (
     BoneZeroRotationObj,
     CombinedDerivativeObj,
     DistanceObjTraj,
@@ -1026,9 +1026,9 @@ class IKGradioApp:
 
     def create_interface(self):
         """Create the Gradio interface with both virtual agent and URDF robot tabs."""
-        with gr.Blocks(title="Interactive Inverse Kinematics Solver", theme=gr.themes.Soft()) as interface:
-            gr.Markdown("# Interactive Inverse Kinematics Solver")
-            gr.Markdown("Choose between Virtual Agent (GLTF) and URDF Robot demos. Adjust parameters and **click on the visualization** to set target positions.")
+        with gr.Blocks(title="JAX-IK", theme=gr.themes.Soft()) as interface:
+            gr.Markdown("# Interactive JAX Inverse Kinematics Solver")
+            gr.Markdown("Choose between the SMPLX skeleton or a URDF Robot demo. Adjust parameters and **click on the visualization** to set target positions.")
             gr.Markdown(
                 "Please note that enabling/disabling an objective function, changing the trajectory points, or setting different controlled bounds forces a retrace the first time, which can take 5-10 seconds."
             )

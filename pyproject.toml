@@ -13,6 +13,7 @@ license = { text = "CC BY-NC-SA 4.0" }
 dependencies = [
   "numpy>=1.19.0",
   "jax>=0.6.2",
+  "jax-cuda12-plugin",
   "configargparse>=1.7",
   "pyvista>=0.45.2",
   "pygltflib>=1.16.3",
