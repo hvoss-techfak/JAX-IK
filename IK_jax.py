@@ -12,7 +12,7 @@ from jax.tree_util import register_pytree_node_class
 import pyvista as pv
 from tqdm import tqdm
 
-from IK_Helper import deform_mesh as deform_mesh_jax, load_mesh_data_from_gltf, load_mesh_data_from_urdf
+from IK_Helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf
 
 
 from IK_Helper import load_skeleton_from_gltf, load_skeleton_from_urdf
@@ -547,7 +547,7 @@ class FKSolver:
             return
 
         # Deform mesh
-        deformed_verts = deform_mesh_jax(angle_vector, self, mesh_data)
+        deformed_verts = deform_mesh(angle_vector, self, mesh_data)
         vertices = np.asarray(deformed_verts)
         faces = mesh_data["faces"]
         pv_faces = np.hstack((np.full((faces.shape[0], 1), 3, dtype=int), faces))
@@ -592,14 +592,46 @@ class InverseKinematicsSolver:
         if self.fk_solver.limits and not bounds:
             print("Using joint limits from URDF file.")
             urdf_bounds = []
+            
+            # Load the URDF to get joint information
+            if self.fk_solver.file_type == ".urdf":
+                import urdfpy
+                robot = urdfpy.URDF.load(self.fk_solver.model_file)
+                joint_info = {}
+                for joint in robot.joints:
+                    joint_info[joint.child] = {
+                        'type': joint.joint_type,
+                        'axis': joint.axis if hasattr(joint, 'axis') and joint.axis is not None else [0, 0, 1]
+                    }
+            
             for bone_name in self.controlled_bones:
-                # URDF limits are on the child link of a joint.
-                # We assume the controlled bone name matches the child link name.
                 if bone_name in self.fk_solver.limits:
                     lower, upper = self.fk_solver.limits[bone_name]
-                    # Assuming XYZ Euler, apply limits to all 3 axes for revolute joints
-                    # This is a simplification; real URDF limits are often for a single axis.
-                    urdf_bounds.extend([(lower, upper), (lower, upper), (lower, upper)])
+                    print(f"Bone '{bone_name}' limits: {lower} to {upper}")
+                    
+                    # Get joint information
+                    if bone_name in joint_info:
+                        joint_type = joint_info[bone_name]['type']
+                        joint_axis = joint_info[bone_name]['axis']
+                        
+                        if joint_type in ['revolute', 'continuous']:
+                            # For revolute joints, apply limits only to the primary rotation axis
+                            # Determine which axis has the largest component
+                            abs_axis = [abs(x) for x in joint_axis]
+                            main_axis = abs_axis.index(max(abs_axis))
+                            
+                            # Create bounds for X, Y, Z rotations
+                            axis_bounds = [(-10, 10), (-10, 10), (-10, 10)]  # Default small range
+                            axis_bounds[main_axis] = (lower, upper)  # Apply real limits to main axis
+                            
+                            urdf_bounds.extend(axis_bounds)
+                            print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
+                        else:
+                            # For other joint types, use conservative limits
+                            urdf_bounds.extend([(lower, upper), (-10, 10), (-10, 10)])
+                    else:
+                        # Default for bones without joint info - conservative limits
+                        urdf_bounds.extend([(lower, upper), (-30, 30), (-30, 30)])
                 else:
                     # Default for bones without limits
                     urdf_bounds.extend([(-180, 180), (-180, 180), (-180, 180)])
@@ -783,7 +815,7 @@ def main():
         description="Inverse Kinematics Solver Configuration",
         default_config_files=["config.ini"],
     )
-    parser.add("--model_file", type=str, default="pepper.urdf", help="Path to the GLB, GLTF, or URDF model file.")
+    parser.add("--model_file", type=str, default="/home/mei/Downloads/robots/pepper_description-master/urdf/pepper.urdf", help="Path to the GLB, GLTF, or URDF model file.")
     parser.add("--hand", type=str, choices=["left", "right"], default="left", help="For GLTF models, specify hand.")
     parser.add("--bounds", type=str, default=None, help="JSON string for joint bounds, e.g., '[[-10, 10], ...]'")
     parser.add("--controlled_bones", type=str, default="[\"LShoulder\",\"LBicep\",\"LForeArm\",\"l_wrist\"]", help="JSON string of bone names to control.")

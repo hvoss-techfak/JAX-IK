@@ -1,6 +1,6 @@
 import numpy as np
 from pygltflib import GLTF2
-import tensorflow as tf
+import jax.numpy as jnp
 import urdfpy
 import trimesh
 
@@ -111,6 +111,35 @@ def load_skeleton_from_urdf(urdf_file):
     skeleton = {}
     limits = {}
 
+    # Create coordinate system transformation matrix:
+    # URDF (Z-up, X-forward) to visualization (Y-up, Z-forward)
+    # First rotate -90° around X to convert Z-up to Y-up
+    # Then rotate 90° around Y to convert X-forward to Z-forward
+    # Finally add translation to recenter the robot
+    rot_x = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    rot_y = np.array([
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    # Add translation to move robot down to center it
+    translation = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, -1.0],  # Move down by 1 unit
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    coord_transform = translation @ rot_y @ rot_x
+
     # First, create all links as potential bones
     link_to_joint = {}  # Maps child link to the joint that creates it
 
@@ -142,13 +171,27 @@ def load_skeleton_from_urdf(urdf_file):
             # This positions the child relative to the parent
             skeleton[child_link]["local_transform"] = joint.origin.astype(np.float32)
 
-            # Store joint limits if available
+            # Store joint limits if available with more restrictive defaults
             if joint.limit is not None and joint.joint_type in ["revolute", "prismatic", "continuous"]:
                 if joint.joint_type == "continuous":
-                    # Continuous joints have no limits
-                    limits[child_link] = (-180, 180)
+                    # Continuous joints get reasonable limits to prevent wild movements
+                    limits[child_link] = (-90, 90)
                 else:
-                    limits[child_link] = (np.rad2deg(joint.limit.lower), np.rad2deg(joint.limit.upper))
+                    # Convert to degrees and apply more conservative limits for safety
+                    lower_deg = max(np.rad2deg(joint.limit.lower), -180)
+                    upper_deg = min(np.rad2deg(joint.limit.upper), 180)
+                    limits[child_link] = (lower_deg, upper_deg)
+            else:
+                # Fixed joints or joints without limits get very restrictive bounds
+                if joint.joint_type == "fixed":
+                    limits[child_link] = (0, 0)  # No movement for fixed joints
+                else:
+                    limits[child_link] = (-30, 30)  # Conservative default
+
+    # Apply coordinate system transformation to root links
+    root_links = [name for name, bone in skeleton.items() if bone["parent"] is None]
+    for root_name in root_links:
+        skeleton[root_name]["local_transform"] = coord_transform @ skeleton[root_name]["local_transform"]
 
     # Calculate bone lengths based on the distance to children
     for link_name, bone in skeleton.items():
@@ -167,64 +210,44 @@ def load_skeleton_from_urdf(urdf_file):
             else:
                 bone["bone_length"] = 0.05  # Small default for leaf nodes
 
-    # Find root links (should typically be one)
-    root_links = [name for name, bone in skeleton.items() if bone["parent"] is None]
-
     print(f"URDF loaded with {len(skeleton)} links")
     print(f"Root links: {root_links}")
     print(f"Joint limits found for: {list(limits.keys())}")
+    print("Applied coordinate transformation: Z-up,X-forward -> Y-up,Z-forward with recentering")
 
     return skeleton, limits
-
-
-def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
-    """Helper for rigid vertex assignment based on bone proximity."""
-    import trimesh
-
-    if scene is None:
-        scene = trimesh.load(gltf_file, force="scene")
-
-    mesh_key = list(scene.geometry.keys())[0]
-    mesh_trimesh = scene.geometry[mesh_key]
-
-    mesh_transform = np.eye(4)
-    # Correctly get transform from scene graph using the geometry key
-    if mesh_key in scene.graph.geometry_nodes:
-        node_name = scene.graph.geometry_nodes[mesh_key][0]
-        mesh_transform = scene.graph.get(node_name)
-    else:
-        print("Warning: No scene graph node found for the mesh. Using identity transform.")
-
-    target_face_count = int(mesh_trimesh.faces.shape[0] * reduction_factor)
-    if target_face_count > 0 and target_face_count < mesh_trimesh.faces.shape[0]:
-        mesh_trimesh = mesh_trimesh.simplify_quadric_decimation(target_face_count)
-
-    vertices = mesh_trimesh.vertices
-    ones = np.ones((vertices.shape[0], 1))
-    vertices_hom = np.hstack([vertices, ones])
-    vertices_transformed = (mesh_transform @ vertices_hom.T).T[:, :3]
-
-    bone_positions = []
-    for i in range(len(fk_solver.bone_names)):
-        bone_positions.append(np.asarray(fk_solver.bind_fk[i][:3, 3]))
-    bone_positions = np.array(bone_positions)
-
-    dists = np.linalg.norm(vertices_transformed[:, None, :] - bone_positions[None, :, :], axis=2)
-    vertex_assignment = np.argmin(dists, axis=1)
-
-    N = vertices_transformed.shape[0]
-
-    mesh_data = {
-        "vertices": tf.constant(np.hstack([vertices_transformed, np.ones((N, 1))]), dtype=tf.float32),
-        "vertex_assignment": tf.constant(vertex_assignment, dtype=tf.int32),
-        "faces": mesh_trimesh.faces,
-    }
-    return mesh_data
 
 
 def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
     """Loads mesh data from a URDF file for rigid skinning."""
     robot = urdfpy.URDF.load(urdf_file)
+
+    # Create coordinate system transformation matrix:
+    # URDF (Z-up, X-forward) to visualization (Y-up, Z-forward)
+    # Include the same translation offset as in skeleton loading
+    rot_x = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    rot_y = np.array([
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    # Add translation to move robot down to center it
+    translation = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, -1.0],  # Move down by 1 unit
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
+    coord_transform = translation @ rot_y @ rot_x
 
     meshes = []
     mesh_to_link = {}  # Track which link each mesh belongs to
@@ -253,8 +276,8 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
                 break
 
         if parent_joint is None:
-            # This is a root link
-            transform = np.eye(4, dtype=np.float32)
+            # This is a root link - apply coordinate transformation
+            transform = coord_transform.astype(np.float32)
         else:
             # Get parent transform and apply joint transform
             parent_transform = compute_link_transform(parent_joint.parent, visited.copy())
@@ -339,7 +362,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
                             mesh_copy.apply_transform(final_transform)
 
                             link_meshes.append(mesh_copy)
-                            print(f"Loaded visual mesh for {link.name} with {mesh_copy.vertices.shape[0]} vertices")
+                            #print(f"Loaded visual mesh for {link.name} with {mesh_copy.vertices.shape[0]} vertices")
 
             except Exception as e:
                 print(f"Failed to process mesh for {link.name}: {e}")
@@ -415,8 +438,8 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
 
     N = vertices.shape[0]
     mesh_data = {
-        "vertices": tf.constant(np.hstack([vertices, np.ones((N, 1))]), dtype=tf.float32),
-        "vertex_assignment": tf.constant(vertex_to_bone_array, dtype=tf.int32),
+        "vertices": jnp.array(np.hstack([vertices, np.ones((N, 1))]), dtype=jnp.float32),
+        "vertex_assignment": jnp.array(vertex_to_bone_array, dtype=jnp.int32),
         "faces": combined_mesh.faces,
         "is_urdf": True,  # Flag to indicate this is URDF mesh data
     }
@@ -540,9 +563,9 @@ def load_mesh_data_from_gltf(gltf_file, fk_solver, reduction_factor=0.5):
 
     N = vertices.shape[0]
     mesh_data = {
-        "vertices": tf.constant(np.hstack([vertices, np.ones((N, 1))]), dtype=tf.float32),
-        "skin_joints": tf.constant(remapped_skin_joints, dtype=tf.int32),
-        "skin_weights": tf.constant(skin_weights_normalized, dtype=tf.float32),
+        "vertices": jnp.array(np.hstack([vertices, np.ones((N, 1))]), dtype=jnp.float32),
+        "skin_joints": jnp.array(remapped_skin_joints, dtype=jnp.int32),
+        "skin_weights": jnp.array(skin_weights_normalized, dtype=jnp.float32),
         "faces": faces,
     }
     return mesh_data
@@ -557,20 +580,20 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
     if "skin_joints" in mesh_data and "skin_weights" in mesh_data:
         print("Using Linear Blend Skinning (LBS) for mesh deformation.")
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)
-        bind_fk_inv = tf.linalg.inv(fk_solver.bind_fk)
-        bone_transforms = tf.matmul(current_fk, bind_fk_inv)
+        bind_fk_inv = jnp.linalg.inv(fk_solver.bind_fk)
+        bone_transforms = jnp.matmul(current_fk, bind_fk_inv)
 
         vertices = mesh_data["vertices"]
         skin_joints = mesh_data["skin_joints"]
         skin_weights = mesh_data["skin_weights"]
 
-        vertex_bone_transforms = tf.gather(bone_transforms, skin_joints)
+        vertex_bone_transforms = bone_transforms[skin_joints]
         weighted_transforms = vertex_bone_transforms * skin_weights[..., None, None]
-        final_transforms = tf.reduce_sum(weighted_transforms, axis=1)
+        final_transforms = jnp.sum(weighted_transforms, axis=1)
 
-        vertices_exp = tf.expand_dims(vertices, axis=-1)
-        deformed_vertices_hom = tf.matmul(final_transforms, vertices_exp)
-        deformed_vertices = tf.squeeze(deformed_vertices_hom, axis=-1)
+        vertices_exp = jnp.expand_dims(vertices, axis=-1)
+        deformed_vertices_hom = jnp.matmul(final_transforms, vertices_exp)
+        deformed_vertices = jnp.squeeze(deformed_vertices_hom, axis=-1)
         return deformed_vertices[:, :3]
     elif "vertex_assignment" in mesh_data:
         if mesh_data.get("is_urdf", False):
@@ -579,14 +602,59 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
             print("Warning: No skinning data found, using rigid vertex assignment.")
 
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)
-        bind_fk_inv = tf.linalg.inv(fk_solver.bind_fk)
-        bone_transforms = tf.matmul(current_fk, bind_fk_inv)
+        bind_fk_inv = jnp.linalg.inv(fk_solver.bind_fk)
+        bone_transforms = jnp.matmul(current_fk, bind_fk_inv)
         vertices = mesh_data["vertices"]
         vertex_assignment = mesh_data["vertex_assignment"]
-        vertex_transforms = tf.gather(bone_transforms, vertex_assignment)
-        vertices_exp = tf.expand_dims(vertices, axis=-1)
-        deformed_vertices_hom = tf.matmul(vertex_transforms, vertices_exp)
-        deformed_vertices = tf.squeeze(deformed_vertices_hom, axis=-1)
+        vertex_transforms = bone_transforms[vertex_assignment]
+        vertices_exp = jnp.expand_dims(vertices, axis=-1)
+        deformed_vertices_hom = jnp.matmul(vertex_transforms, vertices_exp)
+        deformed_vertices = jnp.squeeze(deformed_vertices_hom, axis=-1)
         return deformed_vertices[:, :3]
     else:
         raise ValueError("mesh_data does not contain valid skinning or assignment information.")
+
+
+def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
+    """Helper for rigid vertex assignment based on bone proximity."""
+    import trimesh
+
+    if scene is None:
+        scene = trimesh.load(gltf_file, force="scene")
+
+    mesh_key = list(scene.geometry.keys())[0]
+    mesh_trimesh = scene.geometry[mesh_key]
+
+    mesh_transform = np.eye(4)
+    # Correctly get transform from scene graph using the geometry key
+    if mesh_key in scene.graph.geometry_nodes:
+        node_name = scene.graph.geometry_nodes[mesh_key][0]
+        mesh_transform = scene.graph.get(node_name)
+    else:
+        print("Warning: No scene graph node found for the mesh. Using identity transform.")
+
+    target_face_count = int(mesh_trimesh.faces.shape[0] * reduction_factor)
+    if target_face_count > 0 and target_face_count < mesh_trimesh.faces.shape[0]:
+        mesh_trimesh = mesh_trimesh.simplify_quadric_decimation(target_face_count)
+
+    vertices = mesh_trimesh.vertices
+    ones = np.ones((vertices.shape[0], 1))
+    vertices_hom = np.hstack([vertices, ones])
+    vertices_transformed = (mesh_transform @ vertices_hom.T).T[:, :3]
+
+    bone_positions = []
+    for i in range(len(fk_solver.bone_names)):
+        bone_positions.append(np.asarray(fk_solver.bind_fk[i][:3, 3]))
+    bone_positions = np.array(bone_positions)
+
+    dists = np.linalg.norm(vertices_transformed[:, None, :] - bone_positions[None, :, :], axis=2)
+    vertex_assignment = np.argmin(dists, axis=1)
+
+    N = vertices_transformed.shape[0]
+
+    mesh_data = {
+        "vertices": jnp.array(np.hstack([vertices_transformed, np.ones((N, 1))]), dtype=jnp.float32),
+        "vertex_assignment": jnp.array(vertex_assignment, dtype=jnp.int32),
+        "faces": mesh_trimesh.faces,
+    }
+    return mesh_data
