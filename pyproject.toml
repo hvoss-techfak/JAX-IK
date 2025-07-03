@@ -20,7 +20,7 @@ dependencies = [
   "urchin>=0.0.29",
   "trimesh>=4.6.4",
   "tqdm>=4.67.1",
-  "networkx>=3.5"
+  "networkx>=3.4"
 ]
 
 [tool.setuptools]

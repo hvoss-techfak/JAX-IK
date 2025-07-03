@@ -145,7 +145,7 @@ class IKGradioApp:
     def init_urdf_robot_demo(self):
         """Initialize the URDF robot demo."""
         # Default URDF robot configuration
-        self.urdf_file = "/home/mei/Downloads/robots/pepper_description-master/urdf/pepper.urdf"
+        self.urdf_file = "pepper_description-master/urdf/pepper.urdf"
 
         # Create a basic solver to get available bones
         basic_urdf_solver = InverseKinematicsSolver(
