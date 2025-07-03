@@ -1044,6 +1044,20 @@ class IKGradioApp:
             # Set up initial load for virtual agent tab
             interface.load(fn=self.solve_ik, inputs=va_solve_inputs, outputs=va_outputs)
 
+            gr.Markdown("""
+                ---
+                ### License Information
+                This demo utilizes models with specific licenses. By using this demo, you agree to their terms.
+
+                **1. SMPLX Human Body Model**
+                - **License:** [SMPL-X Model License](https://smpl-x.is.tue.mpg.de/modellicense.html)
+                - **Usage:** For academic and non-commercial research use only. Commercial use requires a separate license.
+
+                **2. Pepper Robot Model**
+                - **License:** [SoftBank Robotics License](https://github.com/softbankrobotics-research/qibullet/blob/master/LICENSE)
+                - **Usage:** For educational and research purposes, subject to SoftBank Robotics' terms of use.
+            """)
+
         return interface
 
 def main():

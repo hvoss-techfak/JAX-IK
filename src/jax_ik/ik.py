@@ -476,14 +476,14 @@ class FKSolver:
         print(f"Root bones: {[name for name, bone in self.skeleton.items() if bone['parent'] is None]}")
 
         # Debug: Print some bone transforms
-        print("Sample bone local transforms:")
-        for i in range(min(5, len(self.bone_names))):
-            bone_name = self.bone_names[i]
-            parent_idx = self.parent_list[i]
-            parent_name = self.bone_names[parent_idx] if parent_idx >= 0 else "ROOT"
-            transform = self.local_list[i]
-            position = transform[:3, 3]
-            print(f"  {bone_name} (parent: {parent_name}): position = {position}")
+        # print("Sample bone local transforms:")
+        # for i in range(min(5, len(self.bone_names))):
+        #     bone_name = self.bone_names[i]
+        #     parent_idx = self.parent_list[i]
+        #     parent_name = self.bone_names[parent_idx] if parent_idx >= 0 else "ROOT"
+        #     transform = self.local_list[i]
+        #     position = transform[:3, 3]
+        #     print(f"  {bone_name} (parent: {parent_name}): position = {position}")
 
     def compute_fk_from_angles(self, angle_vector):
         """
@@ -607,7 +607,7 @@ class InverseKinematicsSolver:
             for bone_name in self.controlled_bones:
                 if bone_name in self.fk_solver.limits:
                     lower, upper = self.fk_solver.limits[bone_name]
-                    print(f"Bone '{bone_name}' limits: {lower} to {upper}")
+                    #print(f"Bone '{bone_name}' limits: {lower} to {upper}")
                     
                     # Get joint information
                     if bone_name in joint_info:
@@ -625,7 +625,7 @@ class InverseKinematicsSolver:
                             axis_bounds[main_axis] = (lower, upper)  # Apply real limits to main axis
                             
                             urdf_bounds.extend(axis_bounds)
-                            print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
+                            #print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
                         else:
                             # For other joint types, use conservative limits
                             urdf_bounds.extend([(lower, upper), (-10, 10), (-10, 10)])

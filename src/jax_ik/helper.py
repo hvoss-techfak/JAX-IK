@@ -253,7 +253,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
     mesh_to_link = {}  # Track which link each mesh belongs to
     vertex_to_bone_map = []  # Track which bone each vertex belongs to
 
-    print("Loading meshes using urchin.Mesh...")
+    #print("Loading meshes using urchin.Mesh...")
 
     # Build forward kinematics manually for mesh positioning
     link_transforms = {}
@@ -408,7 +408,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
         return None
 
     # Combine all meshes
-    print(f"Combining {len(meshes)} meshes...")
+    #print(f"Combining {len(meshes)} meshes...")
     if len(meshes) == 1:
         combined_mesh = meshes[0]
     else:
@@ -418,7 +418,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
             print(f"Failed to concatenate meshes: {e}")
             combined_mesh = meshes[0]
 
-    print(f"Combined mesh has {combined_mesh.vertices.shape[0]} vertices and {combined_mesh.faces.shape[0]} faces")
+    #print(f"Combined mesh has {combined_mesh.vertices.shape[0]} vertices and {combined_mesh.faces.shape[0]} faces")
 
     # Note: Mesh simplification removed - always use original mesh quality
     vertices = combined_mesh.vertices
@@ -432,8 +432,8 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
         print(f"Warning: {np.sum(unmapped_mask)} vertices could not be mapped to bones. Assigning to bone 0.")
         vertex_to_bone_array[unmapped_mask] = 0
 
-    print(f"Vertex-to-bone mapping: {len(vertex_to_bone_array)} vertices mapped to bones")
-    print(f"Bone index range: {vertex_to_bone_array.min()} to {vertex_to_bone_array.max()}")
+    #print(f"Vertex-to-bone mapping: {len(vertex_to_bone_array)} vertices mapped to bones")
+    #print(f"Bone index range: {vertex_to_bone_array.min()} to {vertex_to_bone_array.max()}")
 
     N = vertices.shape[0]
     mesh_data = {
@@ -443,7 +443,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
         "is_urdf": True,  # Flag to indicate this is URDF mesh data
     }
 
-    print(f"Successfully created mesh data with {N} vertices")
+    #print(f"Successfully created mesh data with {N} vertices")
     return mesh_data
 
 
