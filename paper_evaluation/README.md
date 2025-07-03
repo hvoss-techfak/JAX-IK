@@ -2,6 +2,10 @@
 
 Here you can find all the necessary code to evaluate the results presented in the paper. The code is organized into different sections, each corresponding to a specific part of the evaluation process.
 
+# News:
+
+### 2025-07-03: We now have a [Huggingspace](https://huggingface.co/spaces/hvoss-techfak/JAX-IK) demo.
+
 # Installation
 To run the evaluation code, you need to install the required dependencies. You can do this by running the following command:
 
