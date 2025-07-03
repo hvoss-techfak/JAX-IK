@@ -1,5 +1,6 @@
 # JAX-IK
-Official implementation for the paper: "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters"
+Official implementation for the paper: "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters" 
+
 [More Information](https://hvoss-techfak.github.io/TF-JAX-IK/)
 
 # Install
@@ -18,8 +19,6 @@ Finally, go to File -> Export -> glTF 2.0 and follow the export dialog to save y
 
 ```python
 import numpy as np
-import json
-
 from jax_ik.objectives import DistanceObjTraj
 from jax_ik.ik import InverseKinematicsSolver
 
