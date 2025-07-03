@@ -1,7 +1,9 @@
-
 import numpy as np
 from pygltflib import GLTF2
 import tensorflow as tf
+import urdfpy
+import trimesh
+
 
 def quaternion_to_matrix(q):
     x, y, z, w = q
@@ -103,6 +105,77 @@ def load_skeleton_from_gltf(gltf_file):
     return skeleton
 
 
+def load_skeleton_from_urdf(urdf_file):
+    """Loads a skeleton and joint limits from a URDF file."""
+    robot = urdfpy.URDF.load(urdf_file)
+    skeleton = {}
+    limits = {}
+
+    # First, create all links as potential bones
+    link_to_joint = {}  # Maps child link to the joint that creates it
+
+    # Build a mapping from child links to their creating joints
+    for joint in robot.joints:
+        link_to_joint[joint.child] = joint
+
+    # Create skeleton structure
+    for link in robot.links:
+        skeleton[link.name] = {
+            "name": link.name,
+            "local_transform": np.eye(4, dtype=np.float32),
+            "children": [],
+            "parent": None,
+            "bone_length": 0.1,  # Default length
+        }
+
+    # Build parent-child relationships and set transforms
+    for joint in robot.joints:
+        parent_link = joint.parent
+        child_link = joint.child
+
+        if parent_link in skeleton and child_link in skeleton:
+            # Set parent-child relationship
+            skeleton[child_link]["parent"] = parent_link
+            skeleton[parent_link]["children"].append(child_link)
+
+            # The local transform of the child is the joint's origin transform
+            # This positions the child relative to the parent
+            skeleton[child_link]["local_transform"] = joint.origin.astype(np.float32)
+
+            # Store joint limits if available
+            if joint.limit is not None and joint.joint_type in ["revolute", "prismatic", "continuous"]:
+                if joint.joint_type == "continuous":
+                    # Continuous joints have no limits
+                    limits[child_link] = (-180, 180)
+                else:
+                    limits[child_link] = (np.rad2deg(joint.limit.lower), np.rad2deg(joint.limit.upper))
+
+    # Calculate bone lengths based on the distance to children
+    for link_name, bone in skeleton.items():
+        if bone["children"]:
+            # Calculate distance to each child
+            distances = []
+            for child_name in bone["children"]:
+                child_transform = skeleton[child_name]["local_transform"]
+                child_position = child_transform[:3, 3]
+                distance = np.linalg.norm(child_position)
+                if distance > 0.001:  # Only consider significant distances
+                    distances.append(distance)
+
+            if distances:
+                bone["bone_length"] = np.mean(distances)
+            else:
+                bone["bone_length"] = 0.05  # Small default for leaf nodes
+
+    # Find root links (should typically be one)
+    root_links = [name for name, bone in skeleton.items() if bone["parent"] is None]
+
+    print(f"URDF loaded with {len(skeleton)} links")
+    print(f"Root links: {root_links}")
+    print(f"Joint limits found for: {list(limits.keys())}")
+
+    return skeleton, limits
+
 
 def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
     """Helper for rigid vertex assignment based on bone proximity."""
@@ -124,7 +197,7 @@ def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
 
     target_face_count = int(mesh_trimesh.faces.shape[0] * reduction_factor)
     if target_face_count > 0 and target_face_count < mesh_trimesh.faces.shape[0]:
-        mesh_trimesh = mesh_trimesh.simplify_quadratic_decimation(target_face_count)
+        mesh_trimesh = mesh_trimesh.simplify_quadric_decimation(target_face_count)
 
     vertices = mesh_trimesh.vertices
     ones = np.ones((vertices.shape[0], 1))
@@ -146,6 +219,209 @@ def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
         "vertex_assignment": tf.constant(vertex_assignment, dtype=tf.int32),
         "faces": mesh_trimesh.faces,
     }
+    return mesh_data
+
+
+def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
+    """Loads mesh data from a URDF file for rigid skinning."""
+    robot = urdfpy.URDF.load(urdf_file)
+
+    meshes = []
+    mesh_to_link = {}  # Track which link each mesh belongs to
+    vertex_to_bone_map = []  # Track which bone each vertex belongs to
+
+    print("Loading meshes using urdfpy.Mesh...")
+
+    # Build forward kinematics manually for mesh positioning
+    link_transforms = {}
+
+    def compute_link_transform(link_name, visited=None):
+        if visited is None:
+            visited = set()
+        if link_name in visited:
+            return np.eye(4)  # Avoid cycles
+        visited.add(link_name)
+
+        if link_name in link_transforms:
+            return link_transforms[link_name]
+
+        # Find the joint that has this link as child
+        parent_joint = None
+        for joint in robot.joints:
+            if joint.child == link_name:
+                parent_joint = joint
+                break
+
+        if parent_joint is None:
+            # This is a root link
+            transform = np.eye(4, dtype=np.float32)
+        else:
+            # Get parent transform and apply joint transform
+            parent_transform = compute_link_transform(parent_joint.parent, visited.copy())
+            transform = parent_transform @ parent_joint.origin
+
+        link_transforms[link_name] = transform
+        return transform
+
+    # Create a mapping from link names to bone indices
+    link_to_bone_idx = {name: idx for idx, name in enumerate(fk_solver.bone_names)}
+
+    # Load meshes for each link
+    vertex_offset = 0
+    for link in robot.links:
+        link_transform = compute_link_transform(link.name)
+
+        # Try visual meshes first (changed priority)
+        geometries_to_try = []
+        if link.visuals:
+            for visual in link.visuals:
+                if visual.geometry and visual.geometry.mesh:
+                    geometries_to_try.append((visual.geometry.mesh, visual.origin))
+
+        # If no visual meshes, fall back to collision meshes
+        if not geometries_to_try and link.collisions:
+            for collision in link.collisions:
+                if collision.geometry and collision.geometry.mesh:
+                    geometries_to_try.append((collision.geometry.mesh, collision.origin))
+
+        link_meshes = []
+        for urdf_mesh, geom_origin in geometries_to_try:
+            try:
+                # Use urdfpy.Mesh to load the mesh properly
+                if hasattr(urdf_mesh, 'meshes') and urdf_mesh.meshes:
+                    # Already loaded meshes
+                    trimesh_meshes = urdf_mesh.meshes
+                else:
+                    # Load from filename
+                    import os
+                    urdf_dir = os.path.dirname(urdf_file)
+                    mesh_path = urdf_mesh.filename
+
+                    # Handle relative paths
+                    if not os.path.isabs(mesh_path):
+                        possible_paths = [
+                            os.path.join(urdf_dir, mesh_path),
+                            os.path.join(urdf_dir, "..", mesh_path),
+                            os.path.join(urdf_dir, "meshes", os.path.basename(mesh_path)),
+                            mesh_path
+                        ]
+                    else:
+                        possible_paths = [mesh_path]
+
+                    trimesh_meshes = None
+                    for full_path in possible_paths:
+                        if os.path.exists(full_path):
+                            try:
+                                loaded_mesh = trimesh.load(full_path)
+                                if hasattr(loaded_mesh, 'vertices'):
+                                    trimesh_meshes = [loaded_mesh]
+                                elif hasattr(loaded_mesh, 'geometry'):
+                                    # Scene object
+                                    trimesh_meshes = list(loaded_mesh.geometry.values())
+                                break
+                            except Exception as e:
+                                print(f"Failed to load mesh {full_path}: {e}")
+                                continue
+
+                if trimesh_meshes:
+                    for mesh in trimesh_meshes:
+                        if hasattr(mesh, 'vertices') and mesh.vertices.shape[0] > 0:
+                            mesh_copy = mesh.copy()
+
+                            # Apply scaling if specified
+                            if urdf_mesh.scale is not None:
+                                scale_matrix = np.eye(4)
+                                scale_matrix[:3, :3] = np.diag(urdf_mesh.scale)
+                                mesh_copy.apply_transform(scale_matrix)
+
+                            # Apply transforms: link transform, then geometry origin
+                            final_transform = link_transform @ geom_origin
+                            mesh_copy.apply_transform(final_transform)
+
+                            link_meshes.append(mesh_copy)
+                            print(f"Loaded visual mesh for {link.name} with {mesh_copy.vertices.shape[0]} vertices")
+
+            except Exception as e:
+                print(f"Failed to process mesh for {link.name}: {e}")
+                continue
+
+        # Add meshes for this link and track vertex-to-bone mapping
+        if link_meshes:
+            bone_idx = link_to_bone_idx.get(link.name, -1)
+            for mesh in link_meshes:
+                meshes.append(mesh)
+                mesh_to_link[len(meshes)-1] = link.name
+                # Map all vertices of this mesh to this bone
+                num_vertices = mesh.vertices.shape[0]
+                vertex_to_bone_map.extend([bone_idx] * num_vertices)
+        elif link.name in link_to_bone_idx:
+            # Create a simple box if no mesh is found but the link exists as a bone
+            bone_idx = link_to_bone_idx[link.name]
+            transform = compute_link_transform(link.name)
+            box = trimesh.creation.box(extents=[0.05, 0.05, 0.05])
+            box.apply_transform(transform)
+            meshes.append(box)
+            mesh_to_link[len(meshes)-1] = link.name
+            num_vertices = box.vertices.shape[0]
+            vertex_to_bone_map.extend([bone_idx] * num_vertices)
+
+    # Create simple geometry if no meshes found
+    if not meshes:
+        print("No meshes found. Creating simple geometry...")
+        for i, link in enumerate(robot.links):
+            if link.name in link_to_bone_idx:
+                bone_idx = link_to_bone_idx[link.name]
+                transform = compute_link_transform(link.name)
+                box = trimesh.creation.box(extents=[0.05, 0.05, 0.05])
+                box.apply_transform(transform)
+                meshes.append(box)
+                mesh_to_link[i] = link.name
+                num_vertices = box.vertices.shape[0]
+                vertex_to_bone_map.extend([bone_idx] * num_vertices)
+
+        print(f"Created {len(meshes)} simple box meshes")
+
+    if not meshes:
+        print("Error: No meshes could be loaded or created.")
+        return None
+
+    # Combine all meshes
+    print(f"Combining {len(meshes)} meshes...")
+    if len(meshes) == 1:
+        combined_mesh = meshes[0]
+    else:
+        try:
+            combined_mesh = trimesh.util.concatenate(meshes)
+        except Exception as e:
+            print(f"Failed to concatenate meshes: {e}")
+            combined_mesh = meshes[0]
+
+    print(f"Combined mesh has {combined_mesh.vertices.shape[0]} vertices and {combined_mesh.faces.shape[0]} faces")
+
+    # Note: Mesh simplification removed - always use original mesh quality
+    vertices = combined_mesh.vertices
+
+    # Convert vertex-to-bone mapping to numpy array
+    vertex_to_bone_array = np.array(vertex_to_bone_map, dtype=np.int32)
+
+    # Handle any unmapped vertices (bone_idx = -1)
+    unmapped_mask = vertex_to_bone_array == -1
+    if np.any(unmapped_mask):
+        print(f"Warning: {np.sum(unmapped_mask)} vertices could not be mapped to bones. Assigning to bone 0.")
+        vertex_to_bone_array[unmapped_mask] = 0
+
+    print(f"Vertex-to-bone mapping: {len(vertex_to_bone_array)} vertices mapped to bones")
+    print(f"Bone index range: {vertex_to_bone_array.min()} to {vertex_to_bone_array.max()}")
+
+    N = vertices.shape[0]
+    mesh_data = {
+        "vertices": tf.constant(np.hstack([vertices, np.ones((N, 1))]), dtype=tf.float32),
+        "vertex_assignment": tf.constant(vertex_to_bone_array, dtype=tf.int32),
+        "faces": combined_mesh.faces,
+        "is_urdf": True,  # Flag to indicate this is URDF mesh data
+    }
+
+    print(f"Successfully created mesh data with {N} vertices")
     return mesh_data
 
 
@@ -276,9 +552,10 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
     """
     Deforms the mesh vertices using Linear Blend Skinning (LBS) if skinning
     data is available, otherwise falls back to rigid assignment.
+    For URDF meshes, uses per-bone rigid assignment.
     """
     if "skin_joints" in mesh_data and "skin_weights" in mesh_data:
-        # --- LBS Path ---
+        print("Using Linear Blend Skinning (LBS) for mesh deformation.")
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)
         bind_fk_inv = tf.linalg.inv(fk_solver.bind_fk)
         bone_transforms = tf.matmul(current_fk, bind_fk_inv)
@@ -296,7 +573,11 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
         deformed_vertices = tf.squeeze(deformed_vertices_hom, axis=-1)
         return deformed_vertices[:, :3]
     elif "vertex_assignment" in mesh_data:
-        # --- Rigid Assignment Path ---
+        if mesh_data.get("is_urdf", False):
+            print("Using URDF per-bone rigid deformation.")
+        else:
+            print("Warning: No skinning data found, using rigid vertex assignment.")
+
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)
         bind_fk_inv = tf.linalg.inv(fk_solver.bind_fk)
         bone_transforms = tf.matmul(current_fk, bind_fk_inv)

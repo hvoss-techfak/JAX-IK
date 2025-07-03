@@ -2,6 +2,7 @@ import json
 import os
 import time
 from functools import partial
+import pathlib
 
 import configargparse
 import jax
@@ -11,10 +12,10 @@ from jax.tree_util import register_pytree_node_class
 import pyvista as pv
 from tqdm import tqdm
 
-from IK_Helper import deform_mesh as deform_mesh_jax, load_mesh_data_from_gltf
+from IK_Helper import deform_mesh as deform_mesh_jax, load_mesh_data_from_gltf, load_mesh_data_from_urdf
 
 
-from IK_Helper import load_skeleton_from_gltf
+from IK_Helper import load_skeleton_from_gltf, load_skeleton_from_urdf
 
 from IK_objectives_jax import (
     DistanceObjTraj,
@@ -409,8 +410,18 @@ def _solve_ik_core(
 
 
 class FKSolver:
-    def __init__(self, gltf_file, controlled_bones=None):
-        self.skeleton = load_skeleton_from_gltf(gltf_file)
+    def __init__(self, model_file, controlled_bones=None):
+        self.model_file = model_file
+        self.file_type = pathlib.Path(model_file).suffix.lower()
+        self.limits = {}
+
+        if self.file_type in [".glb", ".gltf"]:
+            self.skeleton = load_skeleton_from_gltf(model_file)
+        elif self.file_type == ".urdf":
+            self.skeleton, self.limits = load_skeleton_from_urdf(model_file)
+        else:
+            raise ValueError(f"Unsupported file type: {self.file_type}")
+
         self._prepare_fk_arrays()
         self.controlled_bones = controlled_bones if controlled_bones is not None else []
         self.controlled_indices = [i for i, name in enumerate(self.bone_names) if name in self.controlled_bones]
@@ -424,38 +435,55 @@ class FKSolver:
 
     def _prepare_fk_arrays(self):
         """
-        Walk the joint hierarchy once and create:
-
-          • self.bone_names         list(str)        names in topological order
-          • self.local_list         list[(4,4)]      local bind transforms
-          • self.parent_list        list[int]        Python list of parents
-          • self.local_array        jnp.ndarray(N,4,4)  stacked local matrices
-          • self.parent_indices     jnp.ndarray(N,)     same as parent_list but int32
+        Walk the joint hierarchy once and create arrays for FK computation.
+        This ensures proper topological ordering of bones.
         """
         self.bone_names = []
-        self.local_list = []  # keep for objectives that expect the Python list
-        self.parent_list = []  # keep for objectives that iterate over parents
+        self.local_list = []
+        self.parent_list = []
+
+        visited = set()
 
         def dfs(bone_name, parent_index):
+            if bone_name in visited:
+                return
+            visited.add(bone_name)
+
             current_idx = len(self.bone_names)
             self.bone_names.append(bone_name)
 
             bone = self.skeleton[bone_name]
-            # homogeneous 4×4 bind transform
             self.local_list.append(jnp.asarray(bone["local_transform"], dtype=jnp.float32))
             self.parent_list.append(parent_index)
 
-            for child in bone["children"]:
-                dfs(child, current_idx)
+            # Process children in consistent order
+            for child in sorted(bone["children"]):
+                if child in self.skeleton:
+                    dfs(child, current_idx)
 
-        # One DFS per root so multiple‐root skeletons are supported
-        roots = [b["name"] for b in self.skeleton.values() if b["parent"] is None]
-        for root in roots:
+        # Find root bones (those with no parent)
+        roots = [name for name, bone in self.skeleton.items() if bone["parent"] is None]
+
+        # Process roots in consistent order
+        for root in sorted(roots):
             dfs(root, -1)
 
-        # NumPy-style arrays for fast JAX use
-        self.local_array = jnp.stack(self.local_list, axis=0)  # (N,4,4)
-        self.parent_indices = jnp.asarray(self.parent_list, dtype=jnp.int32)  # (N,)
+        # Convert to JAX arrays
+        self.local_array = jnp.stack(self.local_list, axis=0)
+        self.parent_indices = jnp.asarray(self.parent_list, dtype=jnp.int32)
+
+        print(f"Loaded skeleton with {len(self.bone_names)} bones")
+        print(f"Root bones: {[name for name, bone in self.skeleton.items() if bone['parent'] is None]}")
+
+        # Debug: Print some bone transforms
+        print("Sample bone local transforms:")
+        for i in range(min(5, len(self.bone_names))):
+            bone_name = self.bone_names[i]
+            parent_idx = self.parent_list[i]
+            parent_name = self.bone_names[parent_idx] if parent_idx >= 0 else "ROOT"
+            transform = self.local_list[i]
+            position = transform[:3, 3]
+            print(f"  {bone_name} (parent: {parent_name}): position = {position}")
 
     def compute_fk_from_angles(self, angle_vector):
         """
@@ -463,13 +491,14 @@ class FKSolver:
         """
         angle_vector = jnp.asarray(angle_vector, dtype=jnp.float32)
 
-        return _compute_fk_tf(
+        result = _compute_fk_tf(
             self.local_array,
             self.parent_indices,
             self.default_rotations,
-            tuple(self.controlled_indices),  # *** tuple – hashable static arg ***
+            tuple(self.controlled_indices),
             angle_vector,
         )
+        return result
 
     def get_bone_head_tail_from_fk(self, fk_transforms, bone_name):
         if bone_name not in self.bone_names:
@@ -508,7 +537,15 @@ class FKSolver:
 
         # Load mesh data if not provided
         if mesh_data is None:
-            mesh_data = load_mesh_data_from_gltf(self.skeleton, self)
+            if self.file_type == ".urdf":
+                mesh_data = load_mesh_data_from_urdf(self.model_file, self)
+            else:
+                mesh_data = load_mesh_data_from_gltf(self.model_file, self)
+
+        if mesh_data is None:
+            print("Cannot render: mesh data is missing.")
+            return
+
         # Deform mesh
         deformed_verts = deform_mesh_jax(angle_vector, self, mesh_data)
         vertices = np.asarray(deformed_verts)
@@ -541,15 +578,32 @@ class FKSolver:
 class InverseKinematicsSolver:
     def __init__(
         self,
-        gltf_file,
+        model_file,
         controlled_bones=None,
         bounds=None,
         penalty_weight=0.25,
         threshold=0.01,
         num_steps=1000,
     ):
-        self.fk_solver = FKSolver(gltf_file=gltf_file, controlled_bones=controlled_bones)
+        self.fk_solver = FKSolver(model_file=model_file, controlled_bones=controlled_bones)
         self.controlled_bones = self.fk_solver.controlled_bones
+
+        # Use limits from URDF if available, otherwise use provided bounds
+        if self.fk_solver.limits and not bounds:
+            print("Using joint limits from URDF file.")
+            urdf_bounds = []
+            for bone_name in self.controlled_bones:
+                # URDF limits are on the child link of a joint.
+                # We assume the controlled bone name matches the child link name.
+                if bone_name in self.fk_solver.limits:
+                    lower, upper = self.fk_solver.limits[bone_name]
+                    # Assuming XYZ Euler, apply limits to all 3 axes for revolute joints
+                    # This is a simplification; real URDF limits are often for a single axis.
+                    urdf_bounds.extend([(lower, upper), (lower, upper), (lower, upper)])
+                else:
+                    # Default for bones without limits
+                    urdf_bounds.extend([(-180, 180), (-180, 180), (-180, 180)])
+            bounds = urdf_bounds
 
         bounds_radians = [(np.radians(l), np.radians(h)) for l, h in bounds]
         lower_bounds, upper_bounds = zip(*bounds_radians)
@@ -729,103 +783,107 @@ def main():
         description="Inverse Kinematics Solver Configuration",
         default_config_files=["config.ini"],
     )
-    parser.add("--gltf_file", type=str, default="smplx.glb")
-    parser.add("--hand", type=str, choices=["left", "right"], default="left")
-    parser.add("--bounds", type=str, default=None)
-    parser.add("--controlled_bones", type=str, default=None)
+    parser.add("--model_file", type=str, default="pepper.urdf", help="Path to the GLB, GLTF, or URDF model file.")
+    parser.add("--hand", type=str, choices=["left", "right"], default="left", help="For GLTF models, specify hand.")
+    parser.add("--bounds", type=str, default=None, help="JSON string for joint bounds, e.g., '[[-10, 10], ...]'")
+    parser.add("--controlled_bones", type=str, default="[\"LShoulder\",\"LBicep\",\"LForeArm\",\"l_wrist\"]", help="JSON string of bone names to control.")
+    parser.add("--end_effector_bone", type=str, default="LFinger13_link", help="Name of the end-effector bone for the target.")
     parser.add("--threshold", type=float, default=0.005)
     parser.add("--num_steps", type=int, default=10000)
-    parser.add("--target_points", type=str, default=None)
-    parser.add("--learning_rate", type=float, default=0.1)
+    parser.add("--target_points", type=str, default=None, help="JSON string of target points, e.g., '[[0,0,1], ...]'")
+    parser.add("--learning_rate", type=float, default=0.2)
     parser.add("--additional_objective_weight", type=float, default=0.25)
     parser.add("--subpoints", type=int, default=5)
+    parser.add("--render", action="store_true", help="Render the final pose.")
     args = parser.parse_args()
 
     # Disable GPU for JAX as CPU is a lot faster for this task
     jax.config.update("jax_default_device", "cpu")
 
-    hand = args.hand
+    file_type = pathlib.Path(args.model_file).suffix.lower()
 
-    if args.bounds is None:
-        if hand == "left":
-            bounds = [
-                (-10, 10),
-                (-10, 10),
-                (-10, 10),
-                (-60, 25),
-                (-140, 50),
-                (-70, 25),
-                (-90, 45),
-                (-180, 5),
-                (-10, 10),
-                (-90, 90),
-                (-70, 70),
-                (-80, 80),
-            ]
+    # --- Configuration based on file type ---
+    if file_type == ".urdf":
+        # For URDF, user must specify controlled bones and end effector
+        if not args.controlled_bones or not args.end_effector_bone:
+            raise ValueError("For URDF files, --controlled_bones and --end_effector_bone must be provided.")
+        controlled_bones = json.loads(args.controlled_bones)
+        end_effector = args.end_effector_bone
+        bounds = json.loads(args.bounds) if args.bounds else None
+    else:  # GLTF/GLB
+        hand = args.hand
+        controlled_bones = [f"{hand}_collar", f"{hand}_shoulder", f"{hand}_elbow", f"{hand}_wrist"]
+        end_effector = f"{hand}_index3"
+        if args.bounds is None:
+            bounds = [(-60, 60)] * 3 * len(controlled_bones) # Default wide bounds
         else:
-            bounds = [
-                (-10, 10),
-                (-10, 10),
-                (-10, 10),
-                (-60, 25),
-                (-50, 140),
-                (-25, 70),
-                (-90, 45),
-                (-5, 180),
-                (-10, 10),
-                (-90, 90),
-                (-70, 70),
-                (-80, 80),
-            ]
+            bounds = [tuple(b) for b in json.loads(args.bounds)]
+
+    if args.target_points:
+        targets = [np.array(p) for p in json.loads(args.target_points)]
     else:
-        bounds = [tuple(b) for b in json.loads(args.bounds)]
-    # fmt: off
+        targets = [np.array([0.3, 0.3, 0.35])] # Default target
 
-    controlled_bones = [f"{hand}_collar",f"{hand}_shoulder",f"{hand}_elbow",f"{hand}_wrist",]
-    targets = [np.array([0.0, 0.2, 0.35]),np.array([0.3, 0.3, 0.35]),np.array([0.3, -0.3, 0.5])]
-
+    # --- Initialize Solver ---
     solver = InverseKinematicsSolver(
-        args.gltf_file,
+        args.model_file,
         controlled_bones=controlled_bones,
         bounds=bounds,
         threshold=args.threshold,
         num_steps=args.num_steps,
     )
+
+    print(f"Available bones: {solver.fk_solver.bone_names}")
+    print(f"Controlled bones: {solver.controlled_bones}")
+    print(f"End effector: {end_effector}")
+
+    # Check if controlled bones and end effector exist
+    missing_bones = []
+    for bone in controlled_bones:
+        if bone not in solver.fk_solver.bone_names:
+            missing_bones.append(bone)
+    if end_effector not in solver.fk_solver.bone_names:
+        missing_bones.append(end_effector)
+
+    if missing_bones:
+        print(f"Error: The following bones were not found in the skeleton: {missing_bones}")
+        print("Please check the bone names and update the configuration.")
+        return
+
     initial_rotations = np.zeros(len(solver.controlled_bones) * 3, dtype=np.float32)
-    step_list = []
-    time_list = []
-    for k in tqdm(range(110)):
-        for i, target in enumerate(targets):
-        
-            mandatory_obj_fns = [DistanceObjTraj(target_points=[target,], bone_name=f"{hand}_index3", use_head=True, weight=1.0)]
-            optional_obj_fns = [BoneZeroRotationObj(weight=0.1)]
-            if k > 10:
-                time1 = time.time()
-        
-            best_angles, obj, steps = solver.solve(
-                initial_rotations=initial_rotations,
-                learning_rate=args.learning_rate,
-                mandatory_objective_functions=mandatory_obj_fns,
-                optional_objective_functions=optional_obj_fns,
-                ik_points=args.subpoints,
-            )
-            if k > 10:
-                time_list.append(time.time() - time1)
-                step_list.append(steps)
-        
-            # #print(f"Solving for target {i}: {target}")
-            # 
-            # if best_angles.ndim == 1:
-            #     traj = np.stack([initial_rotations, best_angles], axis=0)
-            # else:
-            #     traj = best_angles
-            # export_data.append((initial_rotations.copy(), traj))
-            # initial_rotations = traj[-1]
-            #print(f"Target {i} solved – objective {obj:.6f}, steps {steps}")
-            
-    print(f"Average steps per target: {np.mean(step_list):.2f} ± {np.std(step_list):.2f}")
-    print(f"Total time for {len(targets)} targets: {np.sum(time_list):.2f} seconds")
-    print(f"Median time per target: {np.median(time_list):.2f} ± {np.std(time_list):.2f} seconds")
-        
+    final_angles = initial_rotations.copy()
+
+    # Show initial pose
+    print("Rendering initial pose...")
+    solver.render(angle_vector=final_angles, target_pos=targets, interactive=True)
+
+    # --- Solve for Targets ---
+    start_time = time.time()
+    for i, target in enumerate(tqdm(targets, desc="Solving IK")):
+        mandatory_obj_fns = [DistanceObjTraj(target_points=[target], bone_name=end_effector, use_head=True, weight=1.0)]
+        optional_obj_fns = [BoneZeroRotationObj(weight=args.additional_objective_weight)]
+
+        best_angles, obj, steps = solver.solve(
+            initial_rotations=final_angles,
+            learning_rate=args.learning_rate,
+            mandatory_objective_functions=mandatory_obj_fns,
+            optional_objective_functions=optional_obj_fns,
+            ik_points=args.subpoints,
+            verbose=False,
+        )
+        final_angles = best_angles[-1]
+        print(f"Target {i} solved in {steps} steps. Objective: {obj:.4f}")
+
+    total_time = time.time() - start_time
+    print(f"\nSolved for {len(targets)} targets in {total_time:.2f} seconds.")
+
+    # --- Render Final Pose ---
+    print("Rendering final pose...")
+    solver.render(
+        angle_vector=final_angles,
+        target_pos=targets,
+        interactive=True
+    )
+
 if __name__ == "__main__":
     main()
