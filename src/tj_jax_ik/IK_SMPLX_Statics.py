@@ -89,20 +89,20 @@ left_arm_bounds_dict = {
 }
 
 left_full_body_bounds_dict = {
-    "left_eye_smplhf": ([-45, -45, -45],[45, 45, 45]),
-    "head": ([-45, -45, -15], [45, 45, 15]),
-    "jaw": ([-45, -45, -45], [45, 45, 45]),
-    "neck": ([-45, -45, -45], [45, 45, 45]),
-    "spine3": ([-45, -45, -45], [45, 45, 45]),
-    "spine2": ([-45, -45, -45], [45, 45, 45]),
-    "spine1": ([-45, -45, -45], [45, 45, 45]),
-    "pelvis": ([-45, -45, -45], [45, 45, 45]),
-    "left_hip": ([-45, -45, -45], [45, 45, 45]),
-    "left_knee": ([-45, -45, -45], [45, 45, 45]),
-    "left_ankle": ([-45, -45, -45], [45, 45, 45]),
-    "left_foot": ([-45, -45, -45], [45, 45, 45]),
+    "left_eye_smplhf": ([-15, -15, -15],[15, 15, 15]),
+    "head": ([-15, -15, -15], [15, 15, 15]),
+    "jaw": ([-15, -15, -15], [15, 15, 15]),
+    "neck": ([-15, -15, -15], [15, 15, 15]),
+    "spine3": ([-15, -15, -15], [15, 15, 15]),
+    "spine2": ([-15, -15, -15], [15, 15, 15]),
+    "spine1": ([-15, -15, -15], [15, 15, 15]),
+    "pelvis": ([-15, -15, -15], [15, 15, 15]),
+    "left_hip": ([-15, -15, -15], [15, 15, 15]),
+    "left_knee": ([-15, -15, -15], [15, 15, 15]),
+    "left_ankle": ([-15, -15, -15], [15, 15, 15]),
+    "left_foot": ([-15, -15, -15], [15, 15, 15]),
 }
-left_full_body_bounds_dict += left_arm_bounds_dict
+left_full_body_bounds_dict = {**left_full_body_bounds_dict, **left_arm_bounds_dict}
 
 
 
@@ -112,7 +112,7 @@ right_bound_inverse = [1,-1,-1]
 def mirror_limits(left_bound_dicts):
     out_bound_dicts = {}
     for k, v in left_bound_dicts.items():
-        if "_left" in k:
+        if "left_" in k:
             k = k.replace("left_", "right_")
             x_min = v[0][0] * right_bound_inverse[0]
             x_max = v[1][0] * right_bound_inverse[0]

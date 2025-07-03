@@ -20,7 +20,7 @@ from IK_Helper import (
     load_mesh_data_from_urdf,
 )
 from IK_Hand_Specification import HandSpecification
-from IK_SMPLX_Statics import left_arm_bounds_dict, right_arm_bounds_dict
+from IK_SMPLX_Statics import left_arm_bounds_dict, right_arm_bounds_dict, complete_full_body_bounds_dict
 from IK_jax import InverseKinematicsSolver
 from IK_objectives_jax import (
     BoneZeroRotationObj,
@@ -33,6 +33,10 @@ class IKGradioApp:
     def __init__(self, args):
         self.args = args
 
+        # Solver caching to avoid recreating solvers
+        self.solver_cache = {}  # Cache for virtual agent solvers
+        self.urdf_solver_cache = {}  # Cache for URDF robot solvers
+
         # Initialize both demos
         self.init_virtual_agent_demo()
         self.init_urdf_robot_demo()
@@ -43,34 +47,87 @@ class IKGradioApp:
         self.temp_gif_files = []
         self.n_jobs = min(24, os.cpu_count())
 
+    def get_solver_cache_key(self, controlled_bones):
+        """Generate a cache key for a given set of controlled bones."""
+        return tuple(sorted(controlled_bones))
+
+    def get_cached_solver(self, controlled_bones, is_urdf=False):
+        """Get or create a cached solver for the given bone configuration."""
+        cache_key = self.get_solver_cache_key(controlled_bones)
+        cache = self.urdf_solver_cache if is_urdf else self.solver_cache
+
+        if cache_key in cache:
+            print(f"Using cached solver for bones: {controlled_bones}")
+            return cache[cache_key]
+
+        print(f"Creating new solver for bones: {controlled_bones}")
+
+        if is_urdf:
+            # Create URDF solver
+            solver = InverseKinematicsSolver(
+                model_file=self.urdf_file,
+                controlled_bones=controlled_bones,
+                bounds=None,  # Use URDF limits
+                threshold=self.args.threshold,
+                num_steps=self.args.num_steps,
+            )
+        else:
+            # Extract bounds for selected bones
+            bounds = []
+            for bone_name in controlled_bones:
+                if bone_name in self.bounds_dict:
+                    lower, upper = self.bounds_dict[bone_name]
+                    for i in range(3):
+                        bounds.append((lower[i], upper[i]))
+                else:
+                    bounds.extend([(-90, 90), (-90, 90), (-90, 90)])
+
+            # Create virtual agent solver
+            solver = InverseKinematicsSolver(
+                model_file=self.args.gltf_file,
+                controlled_bones=controlled_bones,
+                bounds=bounds,
+                threshold=self.args.threshold,
+                num_steps=self.args.num_steps,
+            )
+
+        # Cache the solver
+        cache[cache_key] = solver
+        return solver
+
     def init_virtual_agent_demo(self):
         """Initialize the virtual agent (GLTF) demo."""
-        # Setup bounds and controlled bones based on hand
-        if self.args.hand == "left":
-            self.bounds_dict = left_arm_bounds_dict
-            self.controlled_bones = list(left_arm_bounds_dict.keys())
-        else:
-            self.bounds_dict = right_arm_bounds_dict
-            self.controlled_bones = list(right_arm_bounds_dict.keys())
-
-        # Extract bounds
-        self.bounds = []
-        for bone_name in self.controlled_bones:
-            if bone_name in self.bounds_dict:
-                lower, upper = self.bounds_dict[bone_name]
-                for i in range(3):
-                    self.bounds.append((lower[i], upper[i]))
-            else:
-                self.bounds.extend([(-90, 90), (-90, 90), (-90, 90)])
-
-        # Initialize IK solver for virtual agent
-        self.solver = InverseKinematicsSolver(
+        # Create a basic solver to get available bones
+        basic_solver = InverseKinematicsSolver(
             model_file=self.args.gltf_file,
-            controlled_bones=self.controlled_bones,
-            bounds=self.bounds,
+            controlled_bones=["left_collar"],  # Minimal bones for initialization
+            bounds=[(-90, 90), (-90, 90), (-90, 90)],
             threshold=self.args.threshold,
             num_steps=self.args.num_steps,
         )
+
+        # Get all available bones for selection
+        self.available_bones = basic_solver.fk_solver.bone_names
+
+        # Setup bounds and controlled bones based on hand
+        if self.args.hand == "left":
+            self.bounds_dict = complete_full_body_bounds_dict
+            self.default_controlled_bones = list(left_arm_bounds_dict.keys())
+            self.default_end_effector = "left_index3"
+        else:
+            self.bounds_dict = complete_full_body_bounds_dict
+            self.default_controlled_bones = list(right_arm_bounds_dict.keys())
+            self.default_end_effector = "right_index3"
+
+        # Filter available bones to only include those in bounds_dict
+        self.selectable_bones = [bone for bone in self.available_bones if bone in self.bounds_dict]
+
+        # Initialize with default configuration
+        self.current_controlled_bones = self.default_controlled_bones.copy()
+        self.current_end_effector = self.default_end_effector
+
+        # Get the initial solver from cache
+        self.solver = self.get_cached_solver(self.current_controlled_bones, is_urdf=False)
 
         self.initial_rotations = np.zeros(len(self.solver.controlled_bones) * 3, dtype=np.float32)
         self.best_angles = self.initial_rotations.copy()
@@ -89,17 +146,32 @@ class IKGradioApp:
         """Initialize the URDF robot demo."""
         # Default URDF robot configuration
         self.urdf_file = "/home/mei/Downloads/robots/pepper_description-master/urdf/pepper.urdf"
-        self.urdf_controlled_bones = ["LShoulder", "LBicep", "LForeArm", "l_wrist"]
-        self.urdf_end_effector = "LFinger13_link"
 
-        # Initialize URDF robot solver
-        self.urdf_solver = InverseKinematicsSolver(
+        # Create a basic solver to get available bones
+        basic_urdf_solver = InverseKinematicsSolver(
             model_file=self.urdf_file,
-            controlled_bones=self.urdf_controlled_bones,
-            bounds=None,  # Use URDF limits
+            controlled_bones=["LShoulder"],  # Minimal bones for initialization
+            bounds=None,
             threshold=self.args.threshold,
             num_steps=self.args.num_steps,
         )
+
+        # Get all available bones for URDF robot
+        self.urdf_available_bones = basic_urdf_solver.fk_solver.bone_names
+
+        # Default configuration
+        self.urdf_default_controlled_bones = ["LShoulder", "LBicep","LElbow", "LForeArm", "l_wrist"]
+        self.urdf_default_end_effector = "LFinger13_link"
+
+        # Filter to bones that exist in the robot
+        self.urdf_selectable_bones = [bone for bone in self.urdf_available_bones]
+
+        # Initialize with default configuration
+        self.urdf_current_controlled_bones = self.urdf_default_controlled_bones.copy()
+        self.urdf_current_end_effector = self.urdf_default_end_effector
+
+        # Get the initial solver from cache
+        self.urdf_solver = self.get_cached_solver(self.urdf_current_controlled_bones, is_urdf=True)
 
         self.urdf_initial_rotations = np.zeros(len(self.urdf_solver.controlled_bones) * 3, dtype=np.float32)
         self.urdf_best_angles = self.urdf_initial_rotations.copy()
@@ -123,7 +195,7 @@ class IKGradioApp:
         target_point = np.array([0.0, 0.2, 0.35])
         self.distance_obj = DistanceObjTraj(
             target_points=target_point,
-            bone_name=f"{self.args.hand}_index3",
+            bone_name=self.current_end_effector,
             use_head=True,
             weight=1.0,
         )
@@ -137,7 +209,7 @@ class IKGradioApp:
         target_point = np.array([0.3, 0.3, 0.35])
         self.urdf_distance_obj = DistanceObjTraj(
             target_points=target_point,
-            bone_name=self.urdf_end_effector,
+            bone_name=self.urdf_current_end_effector,
             use_head=True,
             weight=1.0,
         )
@@ -145,6 +217,96 @@ class IKGradioApp:
         sphere_collider = {"center": [0.2, 0.0, 0.35], "radius": 0.1}
         self.urdf_collision_obj = SphereCollisionPenaltyObjTraj(sphere_collider, min_clearance=0.0, weight=1.0)
         self.urdf_collision_enabled = False
+
+    def update_virtual_agent_configuration(self, end_effector, *bone_selections):
+        """Update virtual agent solver configuration based on UI selections."""
+        # Get selected bones from checkboxes
+        selected_bones = []
+        for i, bone_name in enumerate(self.selectable_bones):
+            if i < len(bone_selections) and bone_selections[i]:
+                selected_bones.append(bone_name)
+
+        # Use defaults if nothing selected
+        if not selected_bones:
+            selected_bones = self.default_controlled_bones
+
+        # Validate end effector
+        if end_effector not in self.available_bones:
+            end_effector = self.default_end_effector
+
+        # Check if controlled bones changed
+        bones_changed = selected_bones != self.current_controlled_bones
+        end_effector_changed = end_effector != self.current_end_effector
+
+        if bones_changed or end_effector_changed:
+            # Update controlled bones if they changed
+            if bones_changed:
+                print(f"Controlled bones changed from {self.current_controlled_bones} to {selected_bones}")
+                self.current_controlled_bones = selected_bones
+
+                # Get solver from cache (creates if not exists)
+                self.solver = self.get_cached_solver(self.current_controlled_bones, is_urdf=False)
+
+                # Reset rotations for new bone configuration
+                self.initial_rotations = np.zeros(len(self.solver.controlled_bones) * 3, dtype=np.float32)
+                self.best_angles = self.initial_rotations.copy()
+
+            # Update end effector (this is just a parameter change, no solver recreation needed)
+            if end_effector_changed:
+                print(f"End effector changed from {self.current_end_effector} to {end_effector}")
+                self.current_end_effector = end_effector
+
+            # Update objectives with new end effector
+            self.setup_virtual_agent_objectives()
+
+            return f"Updated: {len(self.current_controlled_bones)} bones, end-effector: {self.current_end_effector}"
+
+        return "Configuration unchanged"
+
+    def update_urdf_robot_configuration(self, end_effector, *bone_selections):
+        """Update URDF robot solver configuration based on UI selections."""
+        # Get selected bones from checkboxes
+        selected_bones = []
+        for i, bone_name in enumerate(self.urdf_selectable_bones):
+            if i < len(bone_selections) and bone_selections[i]:
+                selected_bones.append(bone_name)
+
+        # Use defaults if nothing selected
+        if not selected_bones:
+            selected_bones = self.urdf_default_controlled_bones
+
+        # Validate end effector
+        if end_effector not in self.urdf_available_bones:
+            end_effector = self.urdf_default_end_effector
+
+        # Check if controlled bones changed
+        bones_changed = selected_bones != self.urdf_current_controlled_bones
+        end_effector_changed = end_effector != self.urdf_current_end_effector
+
+        if bones_changed or end_effector_changed:
+            # Update controlled bones if they changed
+            if bones_changed:
+                print(f"URDF controlled bones changed from {self.urdf_current_controlled_bones} to {selected_bones}")
+                self.urdf_current_controlled_bones = selected_bones
+
+                # Get solver from cache (creates if not exists)
+                self.urdf_solver = self.get_cached_solver(self.urdf_current_controlled_bones, is_urdf=True)
+
+                # Reset rotations for new bone configuration
+                self.urdf_initial_rotations = np.zeros(len(self.urdf_solver.controlled_bones) * 3, dtype=np.float32)
+                self.urdf_best_angles = self.urdf_initial_rotations.copy()
+
+            # Update end effector (this is just a parameter change, no solver recreation needed)
+            if end_effector_changed:
+                print(f"URDF end effector changed from {self.urdf_current_end_effector} to {end_effector}")
+                self.urdf_current_end_effector = end_effector
+
+            # Update objectives with new end effector
+            self.setup_urdf_robot_objectives()
+
+            return f"Updated: {len(self.urdf_current_controlled_bones)} bones, end-effector: {self.urdf_current_end_effector}"
+
+        return "Configuration unchanged"
 
     def create_single_frame_data(self, angles, show_skeleton=False):
         """Create frame data that can be safely passed to parallel workers."""
@@ -470,7 +632,7 @@ class IKGradioApp:
 
         try:
             new_target = np.array([target_x, target_y, target_z])
-            self.distance_obj.update_params({"bone_name": f"{self.args.hand}_index3", "use_head": True, "target_points": new_target, "weight": distance_weight})
+            self.distance_obj.update_params({"bone_name": self.current_end_effector, "use_head": True, "target_points": new_target, "weight": distance_weight})
             self.collision_obj.update_params({"weight": collision_weight})
 
             mandatory_fns, optional_fns = [], []
@@ -512,7 +674,7 @@ class IKGradioApp:
                 hand_spec = HandSpecification(**hand_spec_params)
                 spec_objectives = hand_spec.get_objectives(
                     left_hand=self.args.hand == "left",
-                    controlled_bones=self.controlled_bones,
+                    controlled_bones=self.current_controlled_bones,
                     full_trajectory=subpoints > 1,
                     last_position=True,
                     weight=0.5,
@@ -577,7 +739,7 @@ class IKGradioApp:
 
         try:
             new_target = np.array([target_x, target_y, target_z])
-            self.urdf_distance_obj.update_params({"target_points": new_target, "weight": distance_weight})
+            self.urdf_distance_obj.update_params({"bone_name": self.urdf_current_end_effector, "target_points": new_target, "weight": distance_weight})
             self.urdf_collision_obj.update_params({"weight": collision_weight})
 
             mandatory_fns, optional_fns = [], []
@@ -658,12 +820,13 @@ class IKGradioApp:
                             )
                         with gr.Group():
                             gr.Markdown("### IK Parameters")
+                            gr.Markdown("Please note that Gif generation is very slow.")
                             subpoints = gr.Slider(
                                 minimum=1,
                                 maximum=20,
                                 step=1,
                                 value=self.args.subpoints,
-                                label="Trajectory Subpoints \n(>1 creates animated GIF) \n Please note that Gif generation is very slow.",
+                                label="Trajectory Subpoints \n(>1 creates animated GIF)",
                             )
                             show_skeleton = gr.Checkbox(label="Show Skeleton", value=False)
                     with gr.TabItem("🔧 Objectives"):
@@ -711,11 +874,41 @@ class IKGradioApp:
                                 label="Position",
                                 value="None",
                             )
+                    with gr.TabItem("⚙️ Configuration"):
+                        with gr.Group():
+                            gr.Markdown("### End Effector")
+                            end_effector_dropdown = gr.Dropdown(
+                                choices=self.available_bones,
+                                value=self.current_end_effector,
+                                label="End Effector Bone",
+                                info="Select which bone to use as the end effector"
+                            )
+                        with gr.Accordion("Controlled Bones", open=False):
+                            gr.Markdown("### Select bones to solve for:")
+                            bone_checkboxes = []
+                            for bone_name in self.selectable_bones:
+                                is_default = bone_name in self.current_controlled_bones
+                                checkbox = gr.Checkbox(label=bone_name, value=is_default)
+                                bone_checkboxes.append(checkbox)
+
+                        config_status = gr.Textbox(value="Current configuration loaded", label="Configuration Status", interactive=False)
 
         # Define inputs and outputs for virtual agent
         solve_inputs = [target_x, target_y, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton]
         click_inputs = [subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton]
         outputs = [viz_image, status_text]
+
+        # Configuration update inputs
+        config_inputs = [end_effector_dropdown] + bone_checkboxes
+
+        # Handle configuration changes
+        for config_input in config_inputs:
+            config_input.change(
+                fn=self.update_virtual_agent_configuration,
+                inputs=config_inputs,
+                outputs=[config_status],
+                show_progress="hidden"
+            )
 
         # Handle image clicks for virtual agent
         viz_image.select(
@@ -750,6 +943,7 @@ class IKGradioApp:
                             urdf_target_z = gr.Number(value=0.35, label="Target Z", step=0.01, precision=3)
                         with gr.Group():
                             gr.Markdown("### IK Parameters")
+                            gr.Markdown("Please note that Gif generation is very slow.")
                             urdf_subpoints = gr.Slider(
                                 minimum=1,
                                 maximum=20,
@@ -778,11 +972,41 @@ class IKGradioApp:
                             urdf_derivative_enabled = gr.Checkbox(label="Trajectory Smoothing", value=True)
                             gr.Markdown("*Smooths velocity, acceleration, and jerk for natural motion (only for trajectories)*")
                             urdf_derivative_weight = gr.Number(value=0.05, label="Derivative Weight", step=0.01)
+                    with gr.TabItem("⚙️ Configuration"):
+                        with gr.Group():
+                            gr.Markdown("### End Effector")
+                            urdf_end_effector_dropdown = gr.Dropdown(
+                                choices=self.urdf_available_bones,
+                                value=self.urdf_current_end_effector,
+                                label="End Effector Bone",
+                                info="Select which bone to use as the end effector"
+                            )
+                        with gr.Accordion("Controlled Bones", open=False):
+                            gr.Markdown("### Select bones to solve for:")
+                            urdf_bone_checkboxes = []
+                            for bone_name in self.urdf_selectable_bones:
+                                is_default = bone_name in self.urdf_current_controlled_bones
+                                checkbox = gr.Checkbox(label=bone_name, value=is_default)
+                                urdf_bone_checkboxes.append(checkbox)
+
+                        urdf_config_status = gr.Textbox(value="Current configuration loaded", label="Configuration Status", interactive=False)
 
         # Define inputs and outputs for URDF robot
         urdf_solve_inputs = [urdf_target_x, urdf_target_y, urdf_target_z, urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_bone_zero_enabled, urdf_bone_zero_weight, urdf_derivative_enabled, urdf_derivative_weight, urdf_show_skeleton]
         urdf_click_inputs = [urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_bone_zero_enabled, urdf_bone_zero_weight, urdf_derivative_enabled, urdf_derivative_weight, urdf_show_skeleton]
         urdf_outputs = [urdf_viz_image, urdf_status_text]
+
+        # Configuration update inputs for URDF
+        urdf_config_inputs = [urdf_end_effector_dropdown] + urdf_bone_checkboxes
+
+        # Handle configuration changes for URDF
+        for config_input in urdf_config_inputs:
+            config_input.change(
+                fn=self.update_urdf_robot_configuration,
+                inputs=urdf_config_inputs,
+                outputs=[urdf_config_status],
+                show_progress="hidden"
+            )
 
         # Handle image clicks for URDF robot
         urdf_viz_image.select(
@@ -806,7 +1030,7 @@ class IKGradioApp:
             gr.Markdown("# Interactive Inverse Kinematics Solver")
             gr.Markdown("Choose between Virtual Agent (GLTF) and URDF Robot demos. Adjust parameters and **click on the visualization** to set target positions.")
             gr.Markdown(
-                "Please note that enabling/disabling an objective function or changing the trajectory points forces a retrace the first time, which can take 5-10 seconds."
+                "Please note that enabling/disabling an objective function, changing the trajectory points, or setting different controlled bounds forces a retrace the first time, which can take 5-10 seconds."
             )
             with gr.Tabs():
                 # Virtual Agent Tab

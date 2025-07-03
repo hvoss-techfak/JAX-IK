@@ -1,6 +1,6 @@
 import numpy as np
 
-from IK_Hand_Statics import get_pointing_pose, get_shaping_pose, get_flat_pose
+from IK_SMPLX_Statics import get_pointing_pose, get_shaping_pose, get_flat_pose
 from IK_objectives_jax import InitPoseObj, BoneDirectionObjective
 
 
