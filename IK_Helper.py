@@ -59,7 +59,7 @@ def load_skeleton_from_gltf(gltf_file):
         node = gltf.nodes[node_index]
         bone_name = node.name if node.name is not None else f"bone_{node_index}"
         local_transform = get_node_transform(node)
-        # print(f"Node {node_index}: {bone_name} - Local Transform:\n{local_transform}")
+        print(f"Node {node_index}: {bone_name} - Local Transform:\n{local_transform}")
         bone = {
             "name": bone_name,
             "local_transform": local_transform,
@@ -578,7 +578,7 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
     For URDF meshes, uses per-bone rigid assignment.
     """
     if "skin_joints" in mesh_data and "skin_weights" in mesh_data:
-        print("Using Linear Blend Skinning (LBS) for mesh deformation.")
+        #print("Using Linear Blend Skinning (LBS) for mesh deformation.")
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)
         bind_fk_inv = jnp.linalg.inv(fk_solver.bind_fk)
         bone_transforms = jnp.matmul(current_fk, bind_fk_inv)
@@ -596,9 +596,7 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
         deformed_vertices = jnp.squeeze(deformed_vertices_hom, axis=-1)
         return deformed_vertices[:, :3]
     elif "vertex_assignment" in mesh_data:
-        if mesh_data.get("is_urdf", False):
-            print("Using URDF per-bone rigid deformation.")
-        else:
+        if not mesh_data.get("is_urdf", False):
             print("Warning: No skinning data found, using rigid vertex assignment.")
 
         current_fk = fk_solver.compute_fk_from_angles(angle_vector)

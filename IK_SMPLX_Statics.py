@@ -64,7 +64,7 @@ right_hand_bones = {
     14: "right_thumb3",
 }
 
-left_bounds_dict = {
+left_arm_bounds_dict = {
     "left_collar": ([-10, -10, -10], [10, 10, 10]),
     #"left_collar": ([-70, -45, -15], [20, 45, 10]),
     "left_shoulder": ([-120, -140, -65], [70, 50, 25]),
@@ -88,28 +88,56 @@ left_bounds_dict = {
     "left_pinky3": ([-5, -10, -90], [5, 10, 10]),
 }
 
+left_full_body_bounds_dict = {
+    "left_eye_smplhf": ([-45, -45, -45],[45, 45, 45]),
+    "head": ([-45, -45, -15], [45, 45, 15]),
+    "jaw": ([-45, -45, -45], [45, 45, 45]),
+    "neck": ([-45, -45, -45], [45, 45, 45]),
+    "spine3": ([-45, -45, -45], [45, 45, 45]),
+    "spine2": ([-45, -45, -45], [45, 45, 45]),
+    "spine1": ([-45, -45, -45], [45, 45, 45]),
+    "pelvis": ([-45, -45, -45], [45, 45, 45]),
+    "left_hip": ([-45, -45, -45], [45, 45, 45]),
+    "left_knee": ([-45, -45, -45], [45, 45, 45]),
+    "left_ankle": ([-45, -45, -45], [45, 45, 45]),
+    "left_foot": ([-45, -45, -45], [45, 45, 45]),
+}
+left_full_body_bounds_dict += left_arm_bounds_dict
+
 
 
 right_bound_inverse = [1,-1,-1]
 
-right_bounds_dict = {}
-for k,v in left_bounds_dict.items():
-    k = k.replace("left_", "right_")
-    x_min = v[0][0] * right_bound_inverse[0]
-    x_max = v[1][0] * right_bound_inverse[0]
-    y_min = v[0][1] * right_bound_inverse[1]
-    y_max = v[1][1] * right_bound_inverse[1]
-    z_min = v[0][2] * right_bound_inverse[2]
-    z_max = v[1][2] * right_bound_inverse[2]
-    
-    # swap the min and max if needed
-    if x_min > x_max:
-        x_min, x_max = x_max, x_min
-    if y_min > y_max:
-        y_min, y_max = y_max, y_min
-    if z_min > z_max:
-        z_min, z_max = z_max, z_min
-    right_bounds_dict[k] = ([x_min, y_min, z_min], [x_max, y_max, z_max])
+
+def mirror_limits(left_bound_dicts):
+    out_bound_dicts = {}
+    for k, v in left_bound_dicts.items():
+        if "_left" in k:
+            k = k.replace("left_", "right_")
+            x_min = v[0][0] * right_bound_inverse[0]
+            x_max = v[1][0] * right_bound_inverse[0]
+            y_min = v[0][1] * right_bound_inverse[1]
+            y_max = v[1][1] * right_bound_inverse[1]
+            z_min = v[0][2] * right_bound_inverse[2]
+            z_max = v[1][2] * right_bound_inverse[2]
+
+            # swap the min and max if needed
+            if x_min > x_max:
+                x_min, x_max = x_max, x_min
+            if y_min > y_max:
+                y_min, y_max = y_max, y_min
+            if z_min > z_max:
+                z_min, z_max = z_max, z_min
+            out_bound_dicts[k] = ([x_min, y_min, z_min], [x_max, y_max, z_max])
+    return out_bound_dicts
+
+
+right_arm_bounds_dict = mirror_limits(left_arm_bounds_dict)
+right_full_body_bounds_dict = mirror_limits(left_full_body_bounds_dict)
+complete_full_body_bounds_dict = {
+    **left_full_body_bounds_dict,
+    **right_full_body_bounds_dict,
+}
     
 
 def bounds_dict_to_list(bounds_dict, hand_prefix):
@@ -147,8 +175,8 @@ def bounds_dict_to_list(bounds_dict, hand_prefix):
     return flat_bounds, controlled_bones
 
 
-left_bounds, controlled_bones_left = bounds_dict_to_list(left_bounds_dict, "left")
-right_bounds, controlled_bones_right = bounds_dict_to_list(right_bounds_dict, "right")
+left_bounds, controlled_bones_left = bounds_dict_to_list(left_arm_bounds_dict, "left")
+right_bounds, controlled_bones_right = bounds_dict_to_list(right_arm_bounds_dict, "right")
 
 
 # combine both lists

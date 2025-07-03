@@ -20,11 +20,11 @@ from IK_Helper import (
     load_mesh_data_from_urdf,
 )
 from IK_Hand_Specification import HandSpecification
-from IK_Hand_Statics import left_bounds_dict, right_bounds_dict
+from IK_SMPLX_Statics import left_arm_bounds_dict, right_arm_bounds_dict
 from IK_jax import InverseKinematicsSolver
 from IK_objectives_jax import (
     BoneZeroRotationObj,
-    DerivativeObj,
+    CombinedDerivativeObj,
     DistanceObjTraj,
     SphereCollisionPenaltyObjTraj,
 )
@@ -47,11 +47,11 @@ class IKGradioApp:
         """Initialize the virtual agent (GLTF) demo."""
         # Setup bounds and controlled bones based on hand
         if self.args.hand == "left":
-            self.bounds_dict = left_bounds_dict
-            self.controlled_bones = list(left_bounds_dict.keys())
+            self.bounds_dict = left_arm_bounds_dict
+            self.controlled_bones = list(left_arm_bounds_dict.keys())
         else:
-            self.bounds_dict = right_bounds_dict
-            self.controlled_bones = list(right_bounds_dict.keys())
+            self.bounds_dict = right_arm_bounds_dict
+            self.controlled_bones = list(right_arm_bounds_dict.keys())
 
         # Extract bounds
         self.bounds = []
@@ -178,17 +178,19 @@ class IKGradioApp:
             plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
             plotter.clear()
 
+            is_urdf = frame_data.get("is_urdf", False)
+
             # Simplified lighting for faster rendering
             plotter.add_light(pv.Light(position=(2, 2, 2), focal_point=(0, 0, 0), color="white", intensity=1.0))
             plotter.add_light(pv.Light(position=(-2, -2, 2), focal_point=(0, 0, 0), color="white", intensity=0.7))
             plotter.add_light(pv.Light(position=(0, 0, -2), focal_point=(0, 0, 0), color="white", intensity=0.3))
-            plotter.camera_position = [0.0, 0.0, 3.0]
+            plotter.camera_position = [0.0, 0.0, 2.0]
             plotter.camera.focal_point = [0.0, 0.0, 0.0]
             plotter.camera.up = [0.0, 1.0, 0.0]
             plotter.camera.view_angle = 45
 
             # Handle mesh rendering based on type
-            is_urdf = frame_data.get("is_urdf", False)
+
             if len(frame_data["mesh_vertices"]) > 0 and len(frame_data["mesh_faces"]) > 0:
                 # Create mesh from stored data
                 mesh = pv.PolyData(frame_data["mesh_vertices"], frame_data["mesh_faces"])
@@ -390,7 +392,7 @@ class IKGradioApp:
             return self.create_single_frame(best_angles, show_skeleton, is_urdf)
 
     def on_image_click(
-        self, evt: gr.SelectData, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, hand_shape, hand_position, show_skeleton
+        self, evt: gr.SelectData, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton
     ):
         """Handle clicks on the virtual agent visualization image."""
         # Get click coordinates in image space (0 to image dimensions)
@@ -415,14 +417,14 @@ class IKGradioApp:
 
         # Solve with updated coordinates
         viz_result, status = self.solve_ik(
-            new_target_x, new_target_y, new_target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, hand_shape, hand_position, show_skeleton
+            new_target_x, new_target_y, new_target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton
         )
 
         # Return updates but don't trigger change events by using gr.update with specific value
         return viz_result, status, gr.update(value=new_target_x), gr.update(value=new_target_y)
 
     def on_urdf_image_click(
-        self, evt: gr.SelectData, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, show_skeleton
+        self, evt: gr.SelectData, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, show_skeleton
     ):
         """Handle clicks on the URDF robot visualization image."""
         # Get click coordinates and convert to world coordinates (same logic as virtual agent)
@@ -441,7 +443,7 @@ class IKGradioApp:
 
         # Solve with updated coordinates for URDF robot
         viz_result, status = self.solve_urdf_ik(
-            new_target_x, new_target_y, new_target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, show_skeleton
+            new_target_x, new_target_y, new_target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, show_skeleton
         )
 
         return viz_result, status, gr.update(value=new_target_x), gr.update(value=new_target_y)
@@ -457,6 +459,10 @@ class IKGradioApp:
             collision_weight,
             distance_enabled,
             collision_enabled,
+            bone_zero_enabled,
+            bone_zero_weight,
+            derivative_enabled,
+            derivative_weight,
             hand_shape,
             hand_position,
             show_skeleton,
@@ -474,17 +480,15 @@ class IKGradioApp:
                 optional_fns.append(self.collision_obj)
             self.collision_enabled = collision_enabled
 
-            if subpoints > 1:
-                optional_fns.extend(
-                    [
-                        DerivativeObj(order=1, weight=0.01),
-                        DerivativeObj(order=2, weight=0.01),
-                        DerivativeObj(order=3, weight=0.01),
-                        BoneZeroRotationObj(weight=0.05),
-                    ]
-                )
-            else:
-                optional_fns.append(BoneZeroRotationObj(weight=0.1))
+            # Add optional objective functions based on toggles
+            if bone_zero_enabled:
+                optional_fns.append(BoneZeroRotationObj(weight=bone_zero_weight))
+
+            if derivative_enabled and subpoints > 1:
+                optional_fns.append(CombinedDerivativeObj(max_order=3, weights=[derivative_weight] * 3))
+            elif not bone_zero_enabled and not derivative_enabled:
+                # Fallback minimal regularization if no objectives are enabled
+                optional_fns.append(BoneZeroRotationObj(weight=0.01))
 
             hand_spec_params = {
                 "is_pointing": hand_shape == "Pointing",
@@ -564,6 +568,10 @@ class IKGradioApp:
             collision_weight,
             distance_enabled,
             collision_enabled,
+            bone_zero_enabled,
+            bone_zero_weight,
+            derivative_enabled,
+            derivative_weight,
             show_skeleton,
         ) = args
 
@@ -579,17 +587,15 @@ class IKGradioApp:
                 optional_fns.append(self.urdf_collision_obj)
             self.urdf_collision_enabled = collision_enabled
 
-            if subpoints > 1:
-                optional_fns.extend(
-                    [
-                        DerivativeObj(order=1, weight=0.01),
-                        DerivativeObj(order=2, weight=0.01),
-                        DerivativeObj(order=3, weight=0.01),
-                        BoneZeroRotationObj(weight=0.05),
-                    ]
-                )
-            else:
-                optional_fns.append(BoneZeroRotationObj(weight=0.1))
+            # Add optional objective functions based on toggles
+            if bone_zero_enabled:
+                optional_fns.append(BoneZeroRotationObj(weight=bone_zero_weight))
+
+            if derivative_enabled and subpoints > 1:
+                optional_fns.append(CombinedDerivativeObj(max_order=3, weights=[derivative_weight] * 3))
+            elif not bone_zero_enabled and not derivative_enabled:
+                # Fallback minimal regularization if no objectives are enabled
+                optional_fns.append(BoneZeroRotationObj(weight=0.01))
 
             print(f"Starting URDF IK solve with {subpoints} subpoints...")
             start_time = time.time()
@@ -662,11 +668,24 @@ class IKGradioApp:
                             show_skeleton = gr.Checkbox(label="Show Skeleton", value=False)
                     with gr.TabItem("🔧 Objectives"):
                         with gr.Group():
-                            gr.Markdown("### Objective Functions")
+                            gr.Markdown("### Primary Objective Functions")
                             distance_enabled = gr.Checkbox(label="Distance Objective", value=True)
+                            gr.Markdown("*Drives the end-effector toward the target position*")
                             distance_weight = gr.Number(value=1.0, label="Distance Weight", step=0.1)
+
                             collision_enabled = gr.Checkbox(label="Collision Avoidance", value=False)
+                            gr.Markdown("*Prevents bone segments from intersecting with collision spheres*")
                             collision_weight = gr.Number(value=1.0, label="Collision Weight", step=0.1)
+
+                        with gr.Group():
+                            gr.Markdown("### Regularization Objective Functions")
+                            bone_zero_enabled = gr.Checkbox(label="Bone Zero Rotation", value=True)
+                            gr.Markdown("*Keeps joint angles close to zero for natural poses*")
+                            bone_zero_weight = gr.Number(value=0.05, label="Bone Zero Weight", step=0.01)
+
+                            derivative_enabled = gr.Checkbox(label="Trajectory Smoothing", value=True)
+                            gr.Markdown("*Smooths velocity, acceleration, and jerk for natural motion (only for trajectories)*")
+                            derivative_weight = gr.Number(value=0.05, label="Derivative Weight", step=0.01)
                     with gr.TabItem("✋ Hand Spec"):
                         with gr.Group():
                             gr.Markdown("### Hand Shape")
@@ -694,8 +713,8 @@ class IKGradioApp:
                             )
 
         # Define inputs and outputs for virtual agent
-        solve_inputs = [target_x, target_y, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, hand_shape, hand_position, show_skeleton]
-        click_inputs = [subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, hand_shape, hand_position, show_skeleton]
+        solve_inputs = [target_x, target_y, target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton]
+        click_inputs = [subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton]
         outputs = [viz_image, status_text]
 
         # Handle image clicks for virtual agent
@@ -707,7 +726,7 @@ class IKGradioApp:
         )
 
         # Regular inputs trigger the standard solve function
-        auto_solve_inputs = [target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, hand_shape, hand_position, show_skeleton]
+        auto_solve_inputs = [target_z, subpoints, distance_weight, collision_weight, distance_enabled, collision_enabled, bone_zero_enabled, bone_zero_weight, derivative_enabled, derivative_weight, hand_shape, hand_position, show_skeleton]
         for inp in auto_solve_inputs:
             inp.change(fn=self.solve_ik, inputs=solve_inputs, outputs=outputs, show_progress="hidden")
 
@@ -741,15 +760,28 @@ class IKGradioApp:
                             urdf_show_skeleton = gr.Checkbox(label="Show Skeleton", value=False)
                     with gr.TabItem("🔧 Objectives"):
                         with gr.Group():
-                            gr.Markdown("### Objective Functions")
+                            gr.Markdown("### Primary Objective Functions")
                             urdf_distance_enabled = gr.Checkbox(label="Distance Objective", value=True)
+                            gr.Markdown("*Drives the end-effector toward the target position*")
                             urdf_distance_weight = gr.Number(value=1.0, label="Distance Weight", step=0.1)
+
                             urdf_collision_enabled = gr.Checkbox(label="Collision Avoidance", value=False)
+                            gr.Markdown("*Prevents bone segments from intersecting with collision spheres*")
                             urdf_collision_weight = gr.Number(value=1.0, label="Collision Weight", step=0.1)
 
+                        with gr.Group():
+                            gr.Markdown("### Regularization Objective Functions")
+                            urdf_bone_zero_enabled = gr.Checkbox(label="Bone Zero Rotation", value=True)
+                            gr.Markdown("*Keeps joint angles close to zero for natural poses*")
+                            urdf_bone_zero_weight = gr.Number(value=0.05, label="Bone Zero Weight", step=0.01)
+
+                            urdf_derivative_enabled = gr.Checkbox(label="Trajectory Smoothing", value=True)
+                            gr.Markdown("*Smooths velocity, acceleration, and jerk for natural motion (only for trajectories)*")
+                            urdf_derivative_weight = gr.Number(value=0.05, label="Derivative Weight", step=0.01)
+
         # Define inputs and outputs for URDF robot
-        urdf_solve_inputs = [urdf_target_x, urdf_target_y, urdf_target_z, urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_show_skeleton]
-        urdf_click_inputs = [urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_show_skeleton]
+        urdf_solve_inputs = [urdf_target_x, urdf_target_y, urdf_target_z, urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_bone_zero_enabled, urdf_bone_zero_weight, urdf_derivative_enabled, urdf_derivative_weight, urdf_show_skeleton]
+        urdf_click_inputs = [urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_bone_zero_enabled, urdf_bone_zero_weight, urdf_derivative_enabled, urdf_derivative_weight, urdf_show_skeleton]
         urdf_outputs = [urdf_viz_image, urdf_status_text]
 
         # Handle image clicks for URDF robot
@@ -761,7 +793,7 @@ class IKGradioApp:
         )
 
         # Regular inputs trigger the URDF solve function
-        urdf_auto_solve_inputs = [urdf_target_z, urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_show_skeleton]
+        urdf_auto_solve_inputs = [urdf_target_z, urdf_subpoints, urdf_distance_weight, urdf_collision_weight, urdf_distance_enabled, urdf_collision_enabled, urdf_bone_zero_enabled, urdf_bone_zero_weight, urdf_derivative_enabled, urdf_derivative_weight, urdf_show_skeleton]
         for inp in urdf_auto_solve_inputs:
             inp.change(fn=self.solve_urdf_ik, inputs=urdf_solve_inputs, outputs=urdf_outputs, show_progress="hidden")
 
@@ -773,7 +805,9 @@ class IKGradioApp:
         with gr.Blocks(title="Interactive Inverse Kinematics Solver", theme=gr.themes.Soft()) as interface:
             gr.Markdown("# Interactive Inverse Kinematics Solver")
             gr.Markdown("Choose between Virtual Agent (GLTF) and URDF Robot demos. Adjust parameters and **click on the visualization** to set target positions.")
-
+            gr.Markdown(
+                "Please note that enabling/disabling an objective function or changing the trajectory points forces a retrace the first time, which can take 5-10 seconds."
+            )
             with gr.Tabs():
                 # Virtual Agent Tab
                 with gr.TabItem("🤖 Virtual Agent"):

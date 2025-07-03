@@ -287,6 +287,120 @@ class DerivativeObj(ObjectiveFunction):
 
 
 @register_pytree_node_class
+class CombinedDerivativeObj(ObjectiveFunction):
+    """Combined velocity, acceleration and jerk regulariser on the trajectory.
+
+    Computes all derivative orders from 1 up to max_order and combines them
+    with individual weights or a single weight applied to all.
+    """
+
+    def __init__(self, max_order: int, weight: float = 1.0, weights=None, next_frames=None):
+        if max_order not in (1, 2, 3):
+            raise ValueError("max_order must be 1, 2 or 3")
+        self.max_order = int(max_order)
+
+        # If specific weights for each order are provided, use them
+        # Otherwise use the same weight for all orders
+        if weights is not None:
+            if len(weights) != max_order:
+                raise ValueError(f"weights must have length {max_order} for max_order {max_order}")
+            self.weights = jnp.asarray(weights, jnp.float32)
+        else:
+            self.weights = jnp.full(max_order, weight, dtype=jnp.float32)
+
+        if next_frames is None:
+            self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
+        else:
+            self.next_frames = jnp.asarray(next_frames, jnp.float32)
+
+    # pytree -----------------------------------------------------------------
+    def tree_flatten(self):
+        return (self.weights, self.next_frames), (self.max_order,)
+
+    @classmethod
+    def tree_unflatten(cls, aux, leaves):
+        (max_order,) = aux
+        weights, nxt = leaves
+        obj = cls(max_order, weight=1.0, weights=weights)
+        obj.next_frames = nxt
+        return obj
+
+    # API --------------------------------------------------------------------
+    def update_params(self, p):
+        if "max_order" in p:
+            if p["max_order"] not in (1, 2, 3):
+                raise ValueError("max_order must be 1, 2 or 3")
+            old_max_order = self.max_order
+            self.max_order = int(p["max_order"])
+            # Adjust weights array if max_order changed
+            if self.max_order != old_max_order:
+                if self.max_order > old_max_order:
+                    # Extend weights with the last weight value
+                    last_weight = self.weights[-1] if len(self.weights) > 0 else 1.0
+                    new_weights = jnp.concatenate([
+                        self.weights,
+                        jnp.full(self.max_order - old_max_order, last_weight, dtype=jnp.float32)
+                    ])
+                    self.weights = new_weights
+                else:
+                    # Truncate weights
+                    self.weights = self.weights[:self.max_order]
+
+        if "weight" in p:
+            # Set all weights to the same value
+            self.weights = jnp.full(self.max_order, p["weight"], dtype=jnp.float32)
+
+        if "weights" in p:
+            if len(p["weights"]) != self.max_order:
+                raise ValueError(f"weights must have length {self.max_order} for max_order {self.max_order}")
+            self.weights = jnp.asarray(p["weights"], jnp.float32)
+
+        if "next_frames" in p:
+            if p["next_frames"] is None:
+                self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
+            else:
+                self.next_frames = jnp.asarray(p["next_frames"], jnp.float32)
+
+    def get_params(self):
+        return dict(
+            max_order=self.max_order,
+            weights=np.asarray(self.weights).tolist(),
+            next_frames=np.asarray(self.next_frames) if self.next_frames.shape[0] > 0 else None,
+        )
+
+    # loss -------------------------------------------------------------------
+    def __call__(self, X, fk_solver=None):
+        if X.ndim == 1:
+            return jnp.array(0.0, jnp.float32)
+
+        traj = X
+        if self.next_frames.shape[0] > 0:
+            traj = jnp.concatenate([X, self.next_frames], axis=0)
+
+        total_loss = jnp.array(0.0, jnp.float32)
+
+        # Compute losses for all orders up to max_order
+        for order in range(1, self.max_order + 1):
+            if order == 1:
+                if traj.shape[0] < 2:
+                    continue
+                diff = jnp.diff(traj, n=1, axis=0)
+            elif order == 2:
+                if traj.shape[0] < 3:
+                    continue
+                diff = traj[2:] - 2 * traj[1:-1] + traj[:-2]
+            elif order == 3:
+                if traj.shape[0] < 4:
+                    continue
+                diff = traj[3:] - 3 * traj[2:-1] + 3 * traj[1:-2] - traj[:-3]
+
+            order_loss = jnp.mean(jnp.square(diff)) * self.weights[order - 1]
+            total_loss += order_loss
+
+        return total_loss
+
+
+@register_pytree_node_class
 class InitPoseObj(ObjectiveFunction):
     """Anchor the first or last pose (or the whole trajectory) to `init_rot`."""
     # TODO: I think there is still a bug here as the hand shapes are not quite right. I'll have to investigate this.
