@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "TF-JAX-IK"
+name = "jax-ik"
 version="0.1"
 description = "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters"
 authors = [{ name = "Hendric Voss", email = "hvoss@techfak.uni-bielefeld.de" }]
@@ -16,9 +16,10 @@ dependencies = [
   "configargparse>=1.7",
   "pyvista>=0.45.2",
   "pygltflib>=1.16.3",
-  "urdfpy>=0.0.22",
+  "urdfpy @ git+https://github.com/hvoss-techfak/urdfpy",
   "trimesh>=4.6.4",
-  "tqdm>=4.67.1"
+  "tqdm>=4.67.1",
+  "networkx>=3.5"
 ]
 
 [tool.setuptools]

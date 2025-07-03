@@ -14,7 +14,7 @@ import numpy as np
 import pyvista as pv
 
 # --- Local Imports ---
-from IK_Helper import (
+from TF_JAX_IK.IK_Helper import (
     deform_mesh,
     load_mesh_data_from_gltf,
     load_mesh_data_from_urdf,
