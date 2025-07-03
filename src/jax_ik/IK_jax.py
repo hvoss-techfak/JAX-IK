@@ -595,8 +595,8 @@ class InverseKinematicsSolver:
             
             # Load the URDF to get joint information
             if self.fk_solver.file_type == ".urdf":
-                import urdfpy
-                robot = urdfpy.URDF.load(self.fk_solver.model_file)
+                import urchin
+                robot = urchin.URDF.load(self.fk_solver.model_file)
                 joint_info = {}
                 for joint in robot.joints:
                     joint_info[joint.child] = {

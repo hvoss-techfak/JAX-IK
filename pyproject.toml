@@ -16,7 +16,7 @@ dependencies = [
   "configargparse>=1.7",
   "pyvista>=0.45.2",
   "pygltflib>=1.16.3",
-  "urdfpy @ git+https://github.com/hvoss-techfak/urdfpy",
+  "urchin>=0.0.29",
   "trimesh>=4.6.4",
   "tqdm>=4.67.1",
   "networkx>=3.5"

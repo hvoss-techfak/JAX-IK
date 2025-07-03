@@ -1,7 +1,7 @@
 import numpy as np
 from pygltflib import GLTF2
 import jax.numpy as jnp
-import urdfpy
+import urchin
 import trimesh
 
 
@@ -107,7 +107,7 @@ def load_skeleton_from_gltf(gltf_file):
 
 def load_skeleton_from_urdf(urdf_file):
     """Loads a skeleton and joint limits from a URDF file."""
-    robot = urdfpy.URDF.load(urdf_file)
+    robot = urchin.URDF.load(urdf_file)
     skeleton = {}
     limits = {}
 
@@ -220,7 +220,7 @@ def load_skeleton_from_urdf(urdf_file):
 
 def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
     """Loads mesh data from a URDF file for rigid skinning."""
-    robot = urdfpy.URDF.load(urdf_file)
+    robot = urchin.URDF.load(urdf_file)
 
     # Create coordinate system transformation matrix:
     # URDF (Z-up, X-forward) to visualization (Y-up, Z-forward)
@@ -253,7 +253,7 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
     mesh_to_link = {}  # Track which link each mesh belongs to
     vertex_to_bone_map = []  # Track which bone each vertex belongs to
 
-    print("Loading meshes using urdfpy.Mesh...")
+    print("Loading meshes using urchin.Mesh...")
 
     # Build forward kinematics manually for mesh positioning
     link_transforms = {}
@@ -310,7 +310,6 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
         link_meshes = []
         for urdf_mesh, geom_origin in geometries_to_try:
             try:
-                # Use urdfpy.Mesh to load the mesh properly
                 if hasattr(urdf_mesh, 'meshes') and urdf_mesh.meshes:
                     # Already loaded meshes
                     trimesh_meshes = urdf_mesh.meshes
