@@ -5,7 +5,7 @@ Official implementation for the paper: "Real-Time Inverse Kinematics for Generat
 
 # Demo
 
-You can try out the JAX-IK library in this [demo app](https://experiments.scs.techfak.uni-bielefeld.de/jaxik/) \
+You can try out the JAX-IK library in this [demo app](https://experiments.scs.techfak.uni-bielefeld.de/jaxik/)
 
 # Install
 
