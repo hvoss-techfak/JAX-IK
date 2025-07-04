@@ -3,6 +3,10 @@ Official implementation for the paper: "Real-Time Inverse Kinematics for Generat
 
 [More Information](https://hvoss-techfak.github.io/TF-JAX-IK/)
 
+# Demo
+
+You can try out the JAX-IK library in this [demo app](https://experiments.scs.techfak.uni-bielefeld.de/jaxik/)
+
 # Install
 
 You can install the library simply using pip:
