@@ -3,9 +3,129 @@ from pygltflib import GLTF2
 import jax.numpy as jnp
 import urchin
 import trimesh
+from scipy.ndimage import map_coordinates
 
 
-def quaternion_to_matrix(q):
+def compute_sdf(mesh: trimesh.Trimesh, resolution: int = 64) -> dict:
+    """
+    Compute a grid-based Signed Distance Field (SDF) for a given mesh.
+
+    Args:
+        mesh (trimesh.Trimesh): The input mesh to compute the SDF for.
+        resolution (int): The number of grid points along each axis.
+
+    Returns:
+        dict: A dictionary containing:
+            - 'grid': The SDF grid as a JAX array (float32).
+            - 'origin': The origin of the grid (3,).
+            - 'spacing': The spacing between grid points (float32).
+    """
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("Input must be a trimesh.Trimesh object.")
+
+    # Get mesh bounds and add padding
+    bounds = mesh.bounds
+    size = np.max(bounds[1] - bounds[0])
+    center = np.mean(bounds, axis=0)
+
+    # Make the grid slightly larger than the mesh
+    grid_size = size * 1.1
+
+    # Create grid points
+    x = np.linspace(center[0] - grid_size / 2, center[0] + grid_size / 2, resolution)
+    y = np.linspace(center[1] - grid_size / 2, center[1] + grid_size / 2, resolution)
+    z = np.linspace(center[2] - grid_size / 2, center[2] + grid_size / 2, resolution)
+    print(f"Creating SDF grid with resolution {resolution} and grid size {grid_size:.2f} around center {center}")
+    print(f"In total we have x={len(x)} * y={len(y)} * z={len(z)} ({len(x) * len(y) * len(z)} points)")
+    grid_points = np.stack(np.meshgrid(x, y, z, indexing='ij'), axis=-1).reshape(-1, 3)
+
+    # Compute signed distance
+    try:
+        from mesh_to_sdf import mesh_to_sdf
+        print("Computing signed distance field with 'mesh-to-sdf'...")
+        signed_distance = mesh_to_sdf(mesh, grid_points, sign_method='normal')
+    except ImportError:
+        print("Warning: 'mesh-to-sdf' not found. Falling back to slower 'trimesh' implementation.")
+        print("For better performance, please install it: pip install mesh-to-sdf")
+        print(f"Creating ProximityQuery for SDF computation...")
+        proximity_query = trimesh.proximity.ProximityQuery(mesh)
+        print(f"Computing signed distance field. This can take some time...")
+        signed_distance = proximity_query.signed_distance(grid_points)
+
+    sdf_grid = signed_distance.reshape(resolution, resolution, resolution)
+
+    # SDF metadata
+    origin = np.array([x[0], y[0], z[0]], dtype=np.float32)
+    spacing = grid_size / (resolution - 1)
+
+    return {
+        "grid": jnp.asarray(sdf_grid, dtype=jnp.float32),
+        "origin": jnp.asarray(origin, dtype=jnp.float32),
+        "spacing": jnp.float32(spacing),
+    }
+
+
+def inverse_skin_points(
+    points: jnp.ndarray,
+    fk_solver,
+    mesh_data: dict,
+    bone_transforms: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Transform world-space points to rest-pose local space using inverse skinning.
+
+    Args:
+        points (jnp.ndarray): Points in world space, shape (N, 3).
+        fk_solver: The FK solver object containing bind pose and FK transforms.
+        mesh_data (dict): Mesh data with skinning information.
+        bone_transforms (jnp.ndarray): Current bone transforms, shape (num_bones, 4, 4).
+
+    Returns:
+        jnp.ndarray: Points transformed to rest-pose local space, shape (N, 3).
+    """
+    if mesh_data is None or "skin_joints" not in mesh_data or "skin_weights" not in mesh_data:
+        # Fallback for rigid assignment (less accurate for inverse skinning)
+        return points # Cannot do much here
+
+    # Find nearest vertices on the rest mesh to the query points
+    rest_vertices = mesh_data["vertices"][:, :3]
+    dists = jnp.linalg.norm(points[:, None, :] - rest_vertices[None, :, :], axis=2)
+    nearest_vert_indices = jnp.argmin(dists, axis=1)
+
+    # Get skinning info for these vertices
+    skin_joints = mesh_data["skin_joints"][nearest_vert_indices]
+    skin_weights = mesh_data["skin_weights"][nearest_vert_indices]
+
+    # Compute inverse bone transforms
+    bind_fk_inv = jnp.linalg.inv(fk_solver.bind_fk)
+    current_fk = bone_transforms
+    T = jnp.matmul(current_fk, bind_fk_inv)
+    T_inv = jnp.linalg.inv(T)
+
+    # Apply inverse LBS
+    vertex_bone_transforms_inv = T_inv[skin_joints]
+    weighted_transforms_inv = vertex_bone_transforms_inv * skin_weights[..., None, None]
+    final_transforms_inv = jnp.sum(weighted_transforms_inv, axis=1)
+
+    # Transform points from world to rest-pose local
+    points_hom = jnp.concatenate([points, jnp.ones((points.shape[0], 1))], axis=-1)
+    points_hom_exp = jnp.expand_dims(points_hom, axis=-1)
+    local_points_hom = jnp.matmul(final_transforms_inv, points_hom_exp)
+    local_points = jnp.squeeze(local_points_hom, axis=-1)[:, :3]
+
+    return local_points
+
+
+def quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
+    """
+    Convert a quaternion to a 4x4 homogeneous rotation matrix.
+
+    Args:
+        q (np.ndarray): Quaternion as [x, y, z, w].
+
+    Returns:
+        np.ndarray: 4x4 rotation matrix.
+    """
     x, y, z, w = q
     xx = x * x
     yy = y * y
@@ -28,7 +148,16 @@ def quaternion_to_matrix(q):
     return rot
 
 
-def get_node_transform(node):
+def get_node_transform(node) -> np.ndarray:
+    """
+    Get the 4x4 transformation matrix for a GLTF node.
+
+    Args:
+        node: A pygltflib Node object.
+
+    Returns:
+        np.ndarray: 4x4 transformation matrix.
+    """
     if node.matrix is not None and any(node.matrix):
         return np.array(node.matrix, dtype=np.float32).reshape((4, 4)).T
     else:
@@ -42,7 +171,16 @@ def get_node_transform(node):
         return T @ R @ S
 
 
-def load_skeleton_from_gltf(gltf_file):
+def load_skeleton_from_gltf(gltf_file: str) -> dict:
+    """
+    Load a skeleton hierarchy from a GLTF file.
+
+    Args:
+        gltf_file (str): Path to the GLTF or GLB file.
+
+    Returns:
+        dict: Skeleton dictionary mapping bone names to bone data.
+    """
     gltf = GLTF2().load(gltf_file)
 
     root_index = None
@@ -105,8 +243,18 @@ def load_skeleton_from_gltf(gltf_file):
     return skeleton
 
 
-def load_skeleton_from_urdf(urdf_file):
-    """Loads a skeleton and joint limits from a URDF file."""
+def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
+    """
+    Load a skeleton and joint limits from a URDF file.
+
+    Args:
+        urdf_file (str): Path to the URDF file.
+
+    Returns:
+        tuple: (skeleton, limits)
+            - skeleton (dict): Bone hierarchy.
+            - limits (dict): Joint limits per bone.
+    """
     robot = urchin.URDF.load(urdf_file)
     skeleton = {}
     limits = {}
@@ -218,8 +366,22 @@ def load_skeleton_from_urdf(urdf_file):
     return skeleton, limits
 
 
-def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
-    """Loads mesh data from a URDF file for rigid skinning."""
+def load_mesh_data_from_urdf(
+    urdf_file: str,
+    fk_solver,
+    reduction_factor: float = 0.5
+) -> dict:
+    """
+    Load mesh data from a URDF file for rigid skinning.
+
+    Args:
+        urdf_file (str): Path to the URDF file.
+        fk_solver: FK solver object with bone names.
+        reduction_factor (float): Not used (kept for compatibility).
+
+    Returns:
+        dict: Mesh data with vertices, faces, and vertex-to-bone assignment.
+    """
     robot = urchin.URDF.load(urdf_file)
 
     # Create coordinate system transformation matrix:
@@ -447,10 +609,21 @@ def load_mesh_data_from_urdf(urdf_file, fk_solver, reduction_factor=0.5):
     return mesh_data
 
 
-def load_mesh_data_from_gltf(gltf_file, fk_solver, reduction_factor=0.5):
+def load_mesh_data_from_gltf(
+    gltf_file: str,
+    fk_solver,
+    reduction_factor: float = 0.5
+) -> dict:
     """
-    Loads mesh data from a GLTF or GLB file for skinning.
-    This version uses pygltflib to handle binary GLTF files and extract skinning data.
+    Load mesh data from a GLTF or GLB file, including skinning information if available.
+
+    Args:
+        gltf_file (str): Path to the GLTF or GLB file.
+        fk_solver: FK solver object with bone names.
+        reduction_factor (float): Not used (kept for compatibility).
+
+    Returns:
+        dict: Mesh data with vertices, faces, and skinning info if present.
     """
     gltf = GLTF2().load(gltf_file)
 
@@ -570,11 +743,21 @@ def load_mesh_data_from_gltf(gltf_file, fk_solver, reduction_factor=0.5):
     return mesh_data
 
 
-def deform_mesh(angle_vector, fk_solver, mesh_data):
+def deform_mesh(
+    angle_vector: jnp.ndarray,
+    fk_solver,
+    mesh_data: dict
+) -> jnp.ndarray:
     """
-    Deforms the mesh vertices using Linear Blend Skinning (LBS) if skinning
-    data is available, otherwise falls back to rigid assignment.
-    For URDF meshes, uses per-bone rigid assignment.
+    Deform mesh vertices using Linear Blend Skinning (LBS) or rigid assignment.
+
+    Args:
+        angle_vector (jnp.ndarray): Flat array of Euler angles for controlled bones.
+        fk_solver: FK solver object.
+        mesh_data (dict): Mesh data with skinning or assignment info.
+
+    Returns:
+        jnp.ndarray: Deformed mesh vertices, shape (N, 3).
     """
     if "skin_joints" in mesh_data and "skin_weights" in mesh_data:
         #print("Using Linear Blend Skinning (LBS) for mesh deformation.")
@@ -612,8 +795,24 @@ def deform_mesh(angle_vector, fk_solver, mesh_data):
         raise ValueError("mesh_data does not contain valid skinning or assignment information.")
 
 
-def _load_mesh_data_rigid(gltf_file, fk_solver, reduction_factor, scene=None):
-    """Helper for rigid vertex assignment based on bone proximity."""
+def _load_mesh_data_rigid(
+    gltf_file: str,
+    fk_solver,
+    reduction_factor: float,
+    scene=None
+) -> dict:
+    """
+    Helper function for rigid vertex assignment based on bone proximity.
+
+    Args:
+        gltf_file (str): Path to the GLTF or GLB file.
+        fk_solver: FK solver object with bone names.
+        reduction_factor (float): Fraction of faces to keep (for mesh simplification).
+        scene: Optional trimesh.Scene object.
+
+    Returns:
+        dict: Mesh data with vertices, faces, and vertex-to-bone assignment.
+    """
     import trimesh
 
     if scene is None:
