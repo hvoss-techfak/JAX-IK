@@ -321,8 +321,7 @@ def solve_ik(
         beta2=beta2,
         epsilon=epsilon,
         patience=patience,
-        free_indices=free_indices,  # << NEW
-        mask=mask,  # keep for shape checks
+        free_indices=free_indices,
     )
 
 
@@ -354,10 +353,9 @@ def _solve_ik_core(
     epsilon: float = 1e-8,
     patience: int = 200,
     free_indices: jnp.ndarray = None,
-    mask: jnp.ndarray = None,
 ) -> tuple:
     """
-    Core JIT-compiled IK optimization loop using Adam and early stopping.
+    Core JIT-compiled IK optimization loop using cautious Adam and early stopping.
 
     Args:
         init_rot (jnp.ndarray): Initial joint angles.
@@ -374,7 +372,6 @@ def _solve_ik_core(
         epsilon (float): Adam epsilon parameter.
         patience (int): Early stopping patience.
         free_indices (jnp.ndarray): Indices of frames to optimize.
-        mask (jnp.ndarray): Boolean mask for which frames to optimize.
 
     Returns:
         tuple: (iterations, final_angles, best_loss, status_code)
@@ -385,11 +382,6 @@ def _solve_ik_core(
     free_indices = jnp.asarray(free_indices, dtype=jnp.int32)  # << NEW
 
     X_full = init_rot[None, :] if init_rot.ndim == 1 else init_rot
-    T_total = X_full.shape[0]
-
-    if mask is None:
-        mask = jnp.concatenate([jnp.zeros(T_total - 1, dtype=bool), jnp.ones(1, dtype=bool)], axis=0)
-    mask = jnp.asarray(mask, dtype=bool)
 
     x0_free = X_full[free_indices]
     free_T = x0_free.shape[0]
@@ -418,7 +410,6 @@ def _solve_ik_core(
         i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
 
         total, grad = value_and_grad(x)
-        mand, opt = obj_free(x)[1:]
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
@@ -677,7 +668,7 @@ class FKSolver:
             angle_vector = jnp.asarray(angle_vector, dtype=jnp.float32)
 
         # FK transforms
-        fk_transforms = self.compute_fk_from_angles(angle_vector)
+        #fk_transforms = self.compute_fk_from_angles(angle_vector)
 
         # Load mesh data if not provided
         if mesh_data is None:
@@ -704,6 +695,22 @@ class FKSolver:
 
         plotter = pv.Plotter()
         plotter.add_mesh(pv_mesh, color="lightblue", show_edges=False, smooth_shading=True)
+
+        camera_position = [
+            0.0,
+            0.0,
+            3.0,
+        ]
+        focal_point = [
+            0.0,
+            0.0,
+            0.0,
+        ]
+        up_vector = [0.0, 1.0, 0.0]  # Y-up orientation
+
+        plotter.camera_position = camera_position
+        plotter.camera.focal_point = focal_point
+        plotter.camera.up = up_vector
 
         # Draw target positions
         for pt in target_pos:
