@@ -12,14 +12,14 @@ from jax.tree_util import register_pytree_node_class
 import pyvista as pv
 from tqdm import tqdm
 
-from jax_ik.helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf
+from jax_ik.helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf, compute_sdf
 
 
 from jax_ik.helper import load_skeleton_from_gltf, load_skeleton_from_urdf
 
 from jax_ik.objectives import (
     DistanceObjTraj,
-    ObjectiveFunction, BoneZeroRotationObj,
+    ObjectiveFunction, BoneZeroRotationObj, SDFSelfCollisionPenaltyObj,
 )
 
 #make cache temp folder
@@ -32,7 +32,17 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 jax.config.update("jax_platforms", "cpu")
 
 
-def resample_frames(data, target_frames):
+def resample_frames(data: np.ndarray, target_frames: int) -> np.ndarray:
+    """
+    Resample a sequence of frames to a new number of frames using linear interpolation.
+
+    Args:
+        data (np.ndarray): The original data array of shape (frames, dim).
+        target_frames (int): The desired number of frames after resampling.
+
+    Returns:
+        np.ndarray: The resampled data array of shape (target_frames, dim).
+    """
     original_frames, dim = data.shape
     if original_frames == target_frames:
         return data.copy()
@@ -47,8 +57,16 @@ def resample_frames(data, target_frames):
 
 
 @partial(jax.jit, static_argnums=())
-def tf_euler_to_matrix(angles):
-    """Convert XYZ Euler angles (radians) to a 4×4 homogeneous rotation matrix."""
+def tf_euler_to_matrix(angles: jnp.ndarray) -> jnp.ndarray:
+    """
+    Convert XYZ Euler angles (in radians) to a 4x4 homogeneous rotation matrix.
+
+    Args:
+        angles (jnp.ndarray): Array of 3 Euler angles [x, y, z] in radians.
+
+    Returns:
+        jnp.ndarray: 4x4 rotation matrix.
+    """
     cx, cy, cz = jnp.cos(angles)
     sx, sy, sz = jnp.sin(angles)
 
@@ -83,8 +101,16 @@ def tf_euler_to_matrix(angles):
 
 
 @partial(jax.jit, static_argnums=())
-def tf_matrix_to_euler(R):
-    """Inverse of tf_euler_to_matrix – returns XYZ Euler angles (radians)."""
+def tf_matrix_to_euler(R: jnp.ndarray) -> jnp.ndarray:
+    """
+    Convert a 4x4 rotation matrix to XYZ Euler angles (in radians).
+
+    Args:
+        R (jnp.ndarray): 4x4 rotation matrix.
+
+    Returns:
+        jnp.ndarray: Array of 3 Euler angles [x, y, z] in radians.
+    """
     r31 = R[2, 0]
     angle_y = -jnp.arcsin(jnp.clip(r31, -1.0, 1.0))
     angle_x = jnp.arctan2(R[2, 1], R[2, 2])
@@ -93,8 +119,17 @@ def tf_matrix_to_euler(R):
 
 
 @partial(jax.jit, static_argnums=())
-def tf_rotation_matrix_from_axis_angle(axis, angle):
-    """Axis-angle (right-handed) to homogeneous 4×4 matrix."""
+def tf_rotation_matrix_from_axis_angle(axis: jnp.ndarray, angle: float) -> jnp.ndarray:
+    """
+    Create a 4x4 rotation matrix from an axis and angle (right-handed).
+
+    Args:
+        axis (jnp.ndarray): 3D axis vector.
+        angle (float): Rotation angle in radians.
+
+    Returns:
+        jnp.ndarray: 4x4 rotation matrix.
+    """
     x, y, z = axis
     c, s, t = jnp.cos(angle), jnp.sin(angle), 1.0 - jnp.cos(angle)
 
@@ -113,14 +148,24 @@ def tf_rotation_matrix_from_axis_angle(axis, angle):
 
 @partial(jax.jit, static_argnums=(3,))
 def _compute_fk_tf(
-    local_array: jnp.ndarray,  # (N,4,4)  – bind transforms
-    parent_indices: jnp.ndarray,  # (N,)     – parents (-1 = root)
-    default_rotations: jnp.ndarray,  # (N,4,4)  – identity for most bones
-    controlled_indices: tuple,  # *** tuple of ints – hashable! ***
-    angle_vector: jnp.ndarray,  # (K*3,)   – Euler angles for the K controlled bones
+    local_array: jnp.ndarray,
+    parent_indices: jnp.ndarray,
+    default_rotations: jnp.ndarray,
+    controlled_indices: tuple,
+    angle_vector: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Vectorised forward-kinematics with a hashable static skeleton layout.
+    Compute forward kinematics for a skeleton given joint angles.
+
+    Args:
+        local_array (jnp.ndarray): Local bind transforms for each bone (N, 4, 4).
+        parent_indices (jnp.ndarray): Parent indices for each bone (N,).
+        default_rotations (jnp.ndarray): Default (identity) rotations for each bone (N, 4, 4).
+        controlled_indices (tuple): Indices of controlled bones.
+        angle_vector (jnp.ndarray): Euler angles for controlled bones (K*3,).
+
+    Returns:
+        jnp.ndarray: Global transforms for all bones (N, 4, 4).
     """
     ctrl_idx_arr = jnp.asarray(controlled_indices, dtype=jnp.int32)
     num_controlled = len(controlled_indices)
@@ -174,24 +219,42 @@ _OPTIONAL_POOL = []
 
 
 def solve_ik(
-    init_rot,
-    lower_bounds,
-    upper_bounds,
-    mandatory_obj_fns,
-    optional_obj_fns,
-    fksolver,
-    threshold=0.01,
-    num_steps=1000,
-    learning_rate=0.1,
-    beta1=0.9,
-    beta2=0.999,
-    epsilon=1e-8,
-    patience=200,
-    mask=None,
-):
+    init_rot: np.ndarray,
+    lower_bounds: jnp.ndarray,
+    upper_bounds: jnp.ndarray,
+    mandatory_obj_fns: list,
+    optional_obj_fns: list,
+    fksolver: "FKSolver",
+    threshold: float = 0.01,
+    num_steps: int = 1000,
+    learning_rate: float = 0.1,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    epsilon: float = 1e-8,
+    patience: int = 200,
+    mask: np.ndarray = None,
+) -> tuple:
     """
-    Wraps _solve_ik_core with static objective pools so JIT recompilation
-    never occurs between calls (mirrors the TensorFlow trick).
+    Solve inverse kinematics using Adam optimizer and a set of objectives.
+
+    Args:
+        init_rot (np.ndarray): Initial joint angles.
+        lower_bounds (jnp.ndarray): Lower joint limits.
+        upper_bounds (jnp.ndarray): Upper joint limits.
+        mandatory_obj_fns (list): List of mandatory objective functions.
+        optional_obj_fns (list): List of optional objective functions.
+        fksolver (FKSolver): Forward kinematics solver.
+        threshold (float): Stop if loss falls below this value.
+        num_steps (int): Maximum number of optimization steps.
+        learning_rate (float): Adam optimizer learning rate.
+        beta1 (float): Adam beta1 parameter.
+        beta2 (float): Adam beta2 parameter.
+        epsilon (float): Adam epsilon parameter.
+        patience (int): Early stopping patience.
+        mask (np.ndarray): Boolean mask for which frames to optimize.
+
+    Returns:
+        tuple: (iterations, final_angles, best_loss, status_code)
     """
     MAX_MANDATORY = 10
     MAX_OPTIONAL = 10
@@ -258,8 +321,7 @@ def solve_ik(
         beta2=beta2,
         epsilon=epsilon,
         patience=patience,
-        free_indices=free_indices,  # << NEW
-        mask=mask,  # keep for shape checks
+        free_indices=free_indices,
     )
 
 
@@ -277,34 +339,49 @@ def solve_ik(
     ),
 )
 def _solve_ik_core(
-    init_rot,
-    lower_bounds,
-    upper_bounds,
-    mandatory_obj_fns,
-    optional_obj_fns,
-    fksolver,
-    threshold=0.01,
-    num_steps=1000,
-    learning_rate=0.1,
-    beta1=0.9,
-    beta2=0.999,
-    epsilon=1e-8,
-    patience=200,
-    free_indices=None,
-    mask=None,
-):
+    init_rot: jnp.ndarray,
+    lower_bounds: jnp.ndarray,
+    upper_bounds: jnp.ndarray,
+    mandatory_obj_fns: tuple,
+    optional_obj_fns: tuple,
+    fksolver: "FKSolver",
+    threshold: float = 0.01,
+    num_steps: int = 1000,
+    learning_rate: float = 0.1,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    epsilon: float = 1e-8,
+    patience: int = 200,
+    free_indices: jnp.ndarray = None,
+) -> tuple:
+    """
+    Core JIT-compiled IK optimization loop using cautious Adam and early stopping.
 
+    Args:
+        init_rot (jnp.ndarray): Initial joint angles.
+        lower_bounds (jnp.ndarray): Lower joint limits.
+        upper_bounds (jnp.ndarray): Upper joint limits.
+        mandatory_obj_fns (tuple): Tuple of mandatory objective functions.
+        optional_obj_fns (tuple): Tuple of optional objective functions.
+        fksolver (FKSolver): Forward kinematics solver.
+        threshold (float): Stop if loss falls below this value.
+        num_steps (int): Maximum number of optimization steps.
+        learning_rate (float): Adam optimizer learning rate.
+        beta1 (float): Adam beta1 parameter.
+        beta2 (float): Adam beta2 parameter.
+        epsilon (float): Adam epsilon parameter.
+        patience (int): Early stopping patience.
+        free_indices (jnp.ndarray): Indices of frames to optimize.
+
+    Returns:
+        tuple: (iterations, final_angles, best_loss, status_code)
+    """
     init_rot = jnp.asarray(init_rot, dtype=jnp.float32)
     lower_bounds = jnp.asarray(lower_bounds, dtype=jnp.float32)
     upper_bounds = jnp.asarray(upper_bounds, dtype=jnp.float32)
     free_indices = jnp.asarray(free_indices, dtype=jnp.int32)  # << NEW
 
     X_full = init_rot[None, :] if init_rot.ndim == 1 else init_rot
-    T_total = X_full.shape[0]
-
-    if mask is None:
-        mask = jnp.concatenate([jnp.zeros(T_total - 1, dtype=bool), jnp.ones(1, dtype=bool)], axis=0)
-    mask = jnp.asarray(mask, dtype=bool)
 
     x0_free = X_full[free_indices]
     free_T = x0_free.shape[0]
@@ -333,7 +410,6 @@ def _solve_ik_core(
         i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
 
         total, grad = value_and_grad(x)
-        mand, opt = obj_free(x)[1:]
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
@@ -410,10 +486,25 @@ def _solve_ik_core(
 
 
 class FKSolver:
-    def __init__(self, model_file, controlled_bones=None):
+    """
+    Forward Kinematics solver for a skeleton model.
+    Loads skeleton, mesh, and computes SDF if requested.
+    """
+
+    def __init__(self, model_file: str, controlled_bones: list = None, do_compute_sdf: bool = True):
+        """
+        Initialize the FKSolver.
+
+        Args:
+            model_file (str): Path to the model file (GLB, GLTF, or URDF).
+            controlled_bones (list): List of bone names to control.
+            compute_sdf (bool): Whether to compute the mesh SDF for collision.
+        """
         self.model_file = model_file
         self.file_type = pathlib.Path(model_file).suffix.lower()
         self.limits = {}
+        self.mesh_data = None
+        self.sdf = None
 
         if self.file_type in [".glb", ".gltf"]:
             self.skeleton = load_skeleton_from_gltf(model_file)
@@ -433,10 +524,30 @@ class FKSolver:
         zero_angles = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
         self.bind_fk = self.compute_fk_from_angles(zero_angles)
 
-    def _prepare_fk_arrays(self):
+        if do_compute_sdf:
+            # Load mesh and compute SDF
+            print("Loading mesh for SDF computation...")
+            if self.file_type == ".urdf":
+                self.mesh_data = load_mesh_data_from_urdf(self.model_file, self)
+            else:
+                self.mesh_data = load_mesh_data_from_gltf(self.model_file, self)
+    
+            if self.mesh_data:
+                import trimesh
+                print("Computing SDF from mesh...")
+                rest_mesh = trimesh.Trimesh(
+                    vertices=np.asarray(self.mesh_data["vertices"][:, :3]),
+                    faces=np.asarray(self.mesh_data["faces"])
+                )
+                self.sdf = compute_sdf(rest_mesh)
+                print("SDF computation complete.")
+            else:
+                print("Warning: Could not load mesh data. Self-collision will be disabled.")
+
+    def _prepare_fk_arrays(self) -> None:
         """
-        Walk the joint hierarchy once and create arrays for FK computation.
-        This ensures proper topological ordering of bones.
+        Walk the joint hierarchy and create arrays for FK computation.
+        Ensures bones are topologically sorted for FK.
         """
         self.bone_names = []
         self.local_list = []
@@ -485,9 +596,15 @@ class FKSolver:
         #     position = transform[:3, 3]
         #     print(f"  {bone_name} (parent: {parent_name}): position = {position}")
 
-    def compute_fk_from_angles(self, angle_vector):
+    def compute_fk_from_angles(self, angle_vector: jnp.ndarray) -> jnp.ndarray:
         """
-        Compute global bone transforms from the provided Euler angles.
+        Compute global bone transforms from provided Euler angles.
+
+        Args:
+            angle_vector (jnp.ndarray): Flat array of Euler angles for controlled bones.
+
+        Returns:
+            jnp.ndarray: Array of global transforms for all bones.
         """
         angle_vector = jnp.asarray(angle_vector, dtype=jnp.float32)
 
@@ -500,7 +617,17 @@ class FKSolver:
         )
         return result
 
-    def get_bone_head_tail_from_fk(self, fk_transforms, bone_name):
+    def get_bone_head_tail_from_fk(self, fk_transforms: jnp.ndarray, bone_name: str) -> tuple:
+        """
+        Get the world-space head and tail positions of a bone.
+
+        Args:
+            fk_transforms (jnp.ndarray): Array of global transforms for all bones.
+            bone_name (str): Name of the bone.
+
+        Returns:
+            tuple: (head_position, tail_position) as 1D arrays.
+        """
         if bone_name not in self.bone_names:
             print(self.bone_names)
             raise ValueError(f"Bone '{bone_name}' not found in skeleton.")
@@ -516,15 +643,23 @@ class FKSolver:
 
     def render(
         self,
-        angle_vector=None,
-        target_pos=[],
-        collider_spheres=[],
-        mesh_data=None,
+        angle_vector: np.ndarray = None,
+        target_pos: list = [],
+        collider_spheres: list = [],
+        mesh_data: dict = None,
         pv_mesh=None,
-        interactive=False,
-    ):
+        interactive: bool = False,
+    ) -> None:
         """
         Visualize the skeleton, mesh, and objectives using PyVista.
+
+        Args:
+            angle_vector (np.ndarray): Joint angles to render.
+            target_pos (list): List of 3D target points to show.
+            collider_spheres (list): List of sphere colliders to show.
+            mesh_data (dict): Mesh data to use (optional).
+            pv_mesh: Existing PyVista mesh object (optional).
+            interactive (bool): If True, show interactive window.
         """
         # Prepare angles
         if angle_vector is None:
@@ -533,7 +668,7 @@ class FKSolver:
             angle_vector = jnp.asarray(angle_vector, dtype=jnp.float32)
 
         # FK transforms
-        fk_transforms = self.compute_fk_from_angles(angle_vector)
+        #fk_transforms = self.compute_fk_from_angles(angle_vector)
 
         # Load mesh data if not provided
         if mesh_data is None:
@@ -561,6 +696,22 @@ class FKSolver:
         plotter = pv.Plotter()
         plotter.add_mesh(pv_mesh, color="lightblue", show_edges=False, smooth_shading=True)
 
+        camera_position = [
+            0.0,
+            0.0,
+            3.0,
+        ]
+        focal_point = [
+            0.0,
+            0.0,
+            0.0,
+        ]
+        up_vector = [0.0, 1.0, 0.0]  # Y-up orientation
+
+        plotter.camera_position = camera_position
+        plotter.camera.focal_point = focal_point
+        plotter.camera.up = up_vector
+
         # Draw target positions
         for pt in target_pos:
             plotter.add_mesh(pv.Sphere(radius=0.02, center=np.asarray(pt)), color="green")
@@ -576,16 +727,33 @@ class FKSolver:
 
 
 class InverseKinematicsSolver:
+    """
+    High-level IK solver that manages FK, bounds, and optimization.
+    """
+
     def __init__(
         self,
-        model_file,
-        controlled_bones=None,
-        bounds=None,
-        penalty_weight=0.25,
-        threshold=0.01,
-        num_steps=1000,
+        model_file: str,
+        controlled_bones: list = None,
+        bounds: list = None,
+        penalty_weight: float = 0.25,
+        threshold: float = 0.01,
+        num_steps: int = 1000,
+        compute_sdf: bool = True,
     ):
-        self.fk_solver = FKSolver(model_file=model_file, controlled_bones=controlled_bones)
+        """
+        Initialize the IK solver.
+
+        Args:
+            model_file (str): Path to the model file.
+            controlled_bones (list): List of bone names to control.
+            bounds (list): List of (min, max) tuples for each joint angle (degrees).
+            penalty_weight (float): Weight for regularization penalty.
+            threshold (float): Stop if loss falls below this value.
+            num_steps (int): Maximum number of optimization steps.
+            compute_sdf (bool): Whether to compute mesh SDF for collision.
+        """
+        self.fk_solver = FKSolver(model_file=model_file, controlled_bones=controlled_bones,do_compute_sdf=compute_sdf)
         self.controlled_bones = self.fk_solver.controlled_bones
 
         # Use limits from URDF if available, otherwise use provided bounds
@@ -649,13 +817,27 @@ class InverseKinematicsSolver:
 
     def solve_guess(
         self,
-        initial_rotations,
-        learning_rate=0.2,
-        mandatory_objective_functions=(),
-        optional_objective_functions=(),
-        prefix_len=1,
-        patience=200,
-    ):
+        initial_rotations: np.ndarray,
+        learning_rate: float = 0.2,
+        mandatory_objective_functions: tuple = (),
+        optional_objective_functions: tuple = (),
+        prefix_len: int = 1,
+        patience: int = 200,
+    ) -> tuple:
+        """
+        Solve IK for a trajectory, keeping the first prefix_len frames fixed.
+
+        Args:
+            initial_rotations (np.ndarray): Initial joint angle trajectory.
+            learning_rate (float): Adam optimizer learning rate.
+            mandatory_objective_functions (tuple): Mandatory objectives.
+            optional_objective_functions (tuple): Optional objectives.
+            prefix_len (int): Number of frames to keep fixed.
+            patience (int): Early stopping patience.
+
+        Returns:
+            tuple: (final_angles, best_loss, steps)
+        """
         X_full = jnp.asarray(initial_rotations, dtype=jnp.float32)
         mask = jnp.concatenate([jnp.zeros(prefix_len, dtype=bool), jnp.ones(X_full.shape[0] - prefix_len, dtype=bool)])
 
@@ -676,14 +858,29 @@ class InverseKinematicsSolver:
 
     def solve(
         self,
-        initial_rotations=None,
-        learning_rate=0.2,
-        mandatory_objective_functions=(),
-        optional_objective_functions=(),
-        ik_points=1,
-        patience=200,
-        verbose=True,
-    ):
+        initial_rotations: np.ndarray = None,
+        learning_rate: float = 0.2,
+        mandatory_objective_functions: tuple = (),
+        optional_objective_functions: tuple = (),
+        ik_points: int = 1,
+        patience: int = 200,
+        verbose: bool = True,
+    ) -> tuple:
+        """
+        Solve IK for a single pose or a short trajectory.
+
+        Args:
+            initial_rotations (np.ndarray): Initial joint angles (optional).
+            learning_rate (float): Adam optimizer learning rate.
+            mandatory_objective_functions (tuple): Mandatory objectives.
+            optional_objective_functions (tuple): Optional objectives.
+            ik_points (int): Number of frames to optimize after the initial pose.
+            patience (int): Early stopping patience.
+            verbose (bool): If True, print optimization info.
+
+        Returns:
+            tuple: (final_angles, best_loss, steps)
+        """
         if initial_rotations is None:
             initial_rotations = np.zeros(self.lower_bounds.shape, dtype=np.float32)
         initial_rotations = jnp.asarray(initial_rotations, dtype=jnp.float32)
@@ -726,13 +923,24 @@ class InverseKinematicsSolver:
 
     def render(
         self,
-        angle_vector=None,
-        target_pos=[],
-        collider_spheres=[],
-        mesh_data=None,
+        angle_vector: np.ndarray = None,
+        target_pos: list = [],
+        collider_spheres: list = [],
+        mesh_data: dict = None,
         pv_mesh=None,
-        interactive=False,
-    ):
+        interactive: bool = False,
+    ) -> None:
+        """
+        Visualize the current pose and objectives using PyVista.
+
+        Args:
+            angle_vector (np.ndarray): Joint angles to render.
+            target_pos (list): List of 3D target points to show.
+            collider_spheres (list): List of sphere colliders to show.
+            mesh_data (dict): Mesh data to use (optional).
+            pv_mesh: Existing PyVista mesh object (optional).
+            interactive (bool): If True, show interactive window.
+        """
         self.fk_solver.render(
             angle_vector=angle_vector,
             target_pos=target_pos,
@@ -742,7 +950,16 @@ class InverseKinematicsSolver:
             interactive=interactive,
         )
 
-def matrix_to_euler_xyz(R):
+def matrix_to_euler_xyz(R: np.ndarray) -> np.ndarray:
+    """
+    Convert a 3x3 or 4x4 rotation matrix to XYZ Euler angles.
+
+    Args:
+        R (np.ndarray): Rotation matrix.
+
+    Returns:
+        np.ndarray: Array of 3 Euler angles [x, y, z] in radians.
+    """
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     singular = sy < 1e-6
     if not singular:
@@ -756,7 +973,21 @@ def matrix_to_euler_xyz(R):
     return np.array([x, y, z])
 
 
-def export_frames(initial_rot, solved_angles, controlled_bones, export_file="ik_frames.json"):
+def export_frames(
+    initial_rot: np.ndarray,
+    solved_angles: np.ndarray,
+    controlled_bones: list,
+    export_file: str = "ik_frames.json"
+) -> None:
+    """
+    Export a sequence of joint angles to a JSON file.
+
+    Args:
+        initial_rot (np.ndarray): Initial joint angles.
+        solved_angles (np.ndarray): Final joint angles or trajectory.
+        controlled_bones (list): List of bone names.
+        export_file (str): Output JSON file path.
+    """
     initial_rot = np.asarray(initial_rot)
     num_bones = initial_rot.shape[0] // 3
     if len(controlled_bones) != num_bones:
@@ -777,7 +1008,19 @@ def export_frames(initial_rot, solved_angles, controlled_bones, export_file="ik_
     print(f"Exported IK frames to {export_file}")
 
 
-def export_all_frames(trajectories, controlled_bones, export_file="ik_all_trajectories.json"):
+def export_all_frames(
+    trajectories: list,
+    controlled_bones: list,
+    export_file: str = "ik_all_trajectories.json"
+) -> None:
+    """
+    Export multiple trajectories of joint angles to a JSON file.
+
+    Args:
+        trajectories (list): List of (initial_rot, solved_angles) tuples.
+        controlled_bones (list): List of bone names.
+        export_file (str): Output JSON file path.
+    """
     all_frames = []
     for init_rot, solved_angles in trajectories:
         init_rot = np.asarray(init_rot)
@@ -801,7 +1044,22 @@ def export_all_frames(trajectories, controlled_bones, export_file="ik_all_trajec
     print(f"Exported all trajectories to {export_file}")
 
 
-def compute_objective_breakdown(X, objective_list, fk_solver):
+def compute_objective_breakdown(
+    X: np.ndarray,
+    objective_list: list,
+    fk_solver: "FKSolver"
+) -> dict:
+    """
+    Compute the contribution of each objective to the total loss.
+
+    Args:
+        X (np.ndarray): Joint angles to evaluate.
+        objective_list (list): List of (name, objective_function) tuples.
+        fk_solver (FKSolver): Forward kinematics solver.
+
+    Returns:
+        dict: Mapping from objective name to loss value.
+    """
     X_tensor = jnp.asarray(X, dtype=jnp.float32)
     breakdown = {}
     for name, obj_fn in objective_list:
@@ -810,7 +1068,12 @@ def compute_objective_breakdown(X, objective_list, fk_solver):
         breakdown[name] = numeric
     return breakdown
 
-def main():
+def main() -> None:
+    """
+    Command-line entry point for running the IK solver.
+
+    Parses arguments, loads the model, sets up objectives, solves IK, and renders results.
+    """
     parser = configargparse.ArgumentParser(
         description="Inverse Kinematics Solver Configuration",
         default_config_files=["config.ini"],
@@ -893,7 +1156,15 @@ def main():
     start_time = time.time()
     for i, target in enumerate(tqdm(targets, desc="Solving IK")):
         mandatory_obj_fns = [DistanceObjTraj(target_points=[target], bone_name=end_effector, use_head=True, weight=1.0)]
-        optional_obj_fns = [BoneZeroRotationObj(weight=args.additional_objective_weight)]
+        optional_obj_fns = [
+            BoneZeroRotationObj(weight=args.additional_objective_weight),
+            SDFSelfCollisionPenaltyObj(
+                bone_names=controlled_bones,
+                num_samples_per_bone=5,
+                min_dist=0.02,
+                weight=1.0
+            )
+        ]
 
         best_angles, obj, steps = solver.solve(
             initial_rotations=final_angles,

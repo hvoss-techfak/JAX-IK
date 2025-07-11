@@ -108,7 +108,16 @@ left_full_body_bounds_dict = {**left_full_body_bounds_dict, **left_arm_bounds_di
 right_bound_inverse = [1,-1,-1]
 
 
-def mirror_limits(left_bound_dicts):
+def mirror_limits(left_bound_dicts: dict) -> dict:
+    """
+    Mirror joint limits from the left side to the right side of the body.
+
+    Args:
+        left_bound_dicts (dict): Dictionary of left-side joint limits, mapping bone names to (min, max) tuples.
+
+    Returns:
+        dict: Mirrored joint limits for the right side, with axes inverted as appropriate.
+    """
     out_bound_dicts = {}
     for k, v in left_bound_dicts.items():
         if "left_" in k:
@@ -139,7 +148,19 @@ complete_full_body_bounds_dict = {
 }
     
 
-def bounds_dict_to_list(bounds_dict, hand_prefix):
+def bounds_dict_to_list(bounds_dict: dict, hand_prefix: str) -> tuple[list, list]:
+    """
+    Convert a dictionary of joint bounds to a flat list and a list of controlled bone names.
+
+    Args:
+        bounds_dict (dict): Dictionary mapping bone names to (min, max) tuples.
+        hand_prefix (str): Prefix for the hand ("left" or "right").
+
+    Returns:
+        tuple: (flat_bounds, controlled_bones)
+            - flat_bounds (list): List of (min, max) tuples for each joint angle in order.
+            - controlled_bones (list): List of bone names in the same order.
+    """
     # Define the bone order as in the original lists
     bone_order = [
         "collar",
@@ -184,7 +205,13 @@ controlled_bones_both += [b for b in controlled_bones_right if b not in controll
 
 
 
-def get_pointing_pose():
+def get_pointing_pose() -> dict:
+    """
+    Get the default joint angles for a pointing hand pose for both left and right hands.
+
+    Returns:
+        dict: Mapping from bone names to numpy arrays of joint angles (in radians).
+    """
     default_pose = {}
     default_pose["left_thumb1"] = np.array([math.radians(-45), math.radians(45), math.radians(-45)], dtype=np.float32)
     default_pose["left_thumb2"] = np.array([math.radians(0), math.radians(45), math.radians(0)], dtype=np.float32)
@@ -210,7 +237,13 @@ def get_pointing_pose():
     return default_pose
 
 
-def get_shaping_pose():
+def get_shaping_pose() -> dict:
+    """
+    Get the default joint angles for a shaping hand pose for both left and right hands.
+
+    Returns:
+        dict: Mapping from bone names to numpy arrays of joint angles (in radians).
+    """
     default_pose = {}
     default_pose["left_thumb1"] = np.array([math.radians(-10), math.radians(10), math.radians(-10)], dtype=np.float32)
     default_pose["left_thumb2"] = np.array([math.radians(0), math.radians(10), math.radians(0)], dtype=np.float32)
@@ -236,7 +269,13 @@ def get_shaping_pose():
     return default_pose
 
 
-def get_flat_pose():
+def get_flat_pose() -> dict:
+    """
+    Get the default joint angles for a flat hand pose for both left and right hands.
+
+    Returns:
+        dict: Mapping from bone names to numpy arrays of joint angles (in radians).
+    """
     default_pose = {}
     default_pose["left_thumb1"] = np.array([math.radians(0), math.radians(0), math.radians(0)], dtype=np.float32)
     default_pose["left_thumb2"] = np.array([math.radians(0), math.radians(0), math.radians(0)], dtype=np.float32)
