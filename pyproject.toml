@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-ik"
-version="0.1.4"
+version="0.1.5"
 description = "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters"
 authors = [{ name = "Hendric Voss", email = "hvoss@techfak.uni-bielefeld.de" }]
 readme = "README.md"
