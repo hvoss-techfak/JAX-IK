@@ -16,8 +16,9 @@ def plot_success_rate(all_results, output_filename):
         for run in runs:
             for measurement in run:
                 # Use index 4 for success (based on tuple: (iteration, time, time_per_iteration, steps, success))
-                if measurement[4] is not None:
-                    sr_list.append(measurement[4])
+                for m in measurement:
+                    if m[4] is not None:
+                        sr_list.append(m[4]*100)
         if sr_list:
             mean_sr = np.mean(sr_list)
             std_sr = np.std(sr_list)
@@ -106,7 +107,7 @@ def plot_results(all_results, condition, output_filename):
             ticktext=alg_names
         ),
         yaxis=dict(
-            title="Mean Time (seconds)"
+            title="Mean Time per solve (seconds)"
         ),
         margin=dict(l=20, r=20, t=40, b=20),
     )
@@ -199,6 +200,9 @@ def create_gpu_cpu_latex_table(all_results):
             if times:
                 mean_time = np.mean(times)
                 std_time = np.std(times)
+                impl = impl.replace("tensorflow", "TensorFlow").replace("jax", "Jax")
+                impl = impl.replace("fabrik", "FABRIK").replace("ccd", "CCD")
+                impl = impl.replace(" only target", "").replace(" with custom objective", "")
                 table += f"{impl.capitalize()} & {device.upper()} & {mean_time:.4f} $\\pm$ {std_time:.4f} \\ \\n"
 
     table += "\\hline\\hline\n"
@@ -400,7 +404,11 @@ Algorithm & Custom Objective & Solving Time (ms) & Iterations & Time per Iterati
 
         # Determine if custom objective is used based on the algorithm name.
         custom_obj = "Yes" if "custom objective" in alg.lower() else "No"
-        row = f"{alg} & {custom_obj} & {mean_time*1000:.2f} $\\pm$ {std_time*1000:.2f} & {mean_iter:.2f} $\\pm$ {std_iter:.2f} & {mean_tpi*1000:.2f} $\\pm$ {std_tpi*1000:.2f} & {mean_success*100:.2f} $\\pm$ {std_success*100:.2f} \\\\"
+        impl = alg
+        impl = impl.replace("tensorflow", "TensorFlow").replace("jax", "Jax")
+        impl = impl.replace("fabrik", "FABRIK").replace("ccd", "CCD")
+        impl = impl.replace(" only target", "").replace(" with custom objective", "")
+        row = f"{impl} & {custom_obj} & {mean_time*1000:.2f} $\\pm$ {std_time*1000:.2f} & {mean_iter:.2f} $\\pm$ {std_iter:.2f} & {mean_tpi*1000:.2f} $\\pm$ {std_tpi*1000:.2f} & {mean_success*100:.2f} $\\pm$ {std_success*100:.2f} \\\\"
         print(row)
 
     footer = r"""\hline

@@ -29,13 +29,15 @@ def run_script_full(script_name, args, num_runs=5):
     """
     all_runs_data = []
 
+    print("Running script:", script_name)
+
     env = os.environ.copy()
     # env["JAX_PLATFORMS"] = "cpu"
     for run in tqdm(range(1, num_runs + 1)):
         cmd = ["python", script_name] + args
         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         output = result.stdout + "\n" + result.stderr
-        print(output)
+        #print(output)
 
         run_data = []
         # Process each line looking for iteration data.
@@ -53,7 +55,7 @@ def run_script_full(script_name, args, num_runs=5):
 
                 steps = int(m.group(3))
                 success = 1 if m.group(4) == "True" else 0
-                print(f"Iteration {iteration_num}: {time_taken:.8f} seconds, {steps} steps, success={success}")
+                #print(f"Iteration {iteration_num}: {time_taken:.8f} seconds, {steps} steps, success={success}")
                 run_data.append((iteration_num, time_taken,time_per_iteration, steps, success))
             #print average data
         time_taken = np.median([o[1] for o in run_data])
@@ -207,67 +209,53 @@ def main():
 
     implementations = [
         ["ipopt only target", "ik_ipopt.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0"]],
-        ["ipopt with custom objective", "ik_ipopt.py", ["--target_points", targets_str]],
+        ["ipopt with custom objective", "ik_ipopt.py", ["--target_points", targets_str, "--additional_objective_weight", "0.25", ]],
         ["ccd only target", "ablation.py", ["--target_points", targets_str, "--solver_type", "ccd"]],
         ["fabrik only target", "ablation.py", ["--target_points", targets_str, "--solver_type", "fabrik"]],
-        ["ccd with custom objective", "ablation.py", ["--target_points", targets_str, "--solver_type", "ccd", "--custom_objective", "True"]],
-        ["fabrik with custom objective", "ablation.py", ["--target_points", targets_str, "--solver_type", "fabrik","--custom_objective", "True"]],
+        ["ccd with custom objective", "ablation.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--solver_type", "ccd", "--custom_objective", "True"]],
+        ["fabrik with custom objective", "ablation.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--solver_type", "fabrik","--custom_objective", "True"]],
 
         ["tensorflow only target gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "0"]],
         ["jax only target gpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "0"]],
-        ["jax with custom objective gpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "0"]],
-        ["tensorflow with custom objective gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "0"]],
+        ["jax with custom objective gpu", "ik_jax.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "0"]],
+        ["tensorflow with custom objective gpu", "ik_tensorflow.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "0"]],
 
         ["tensorflow only target cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "0", "--cpu_only"]],
         ["jax only target cpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "0", "--cpu_only"]],
-        ["jax with custom objective cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "0", "--cpu_only"]],
-        ["tensorflow with custom objective cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "0", "--cpu_only"]],
+        ["jax with custom objective cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "0","--additional_objective_weight", "0.25",  "--cpu_only"]],
+        ["tensorflow with custom objective cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "0","--additional_objective_weight", "0.25",  "--cpu_only"]],
 
         ["tensorflow only target subpoints 5 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "5", "--cpu_only"]],
         ["jax only target subpoints 5 cpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "5", "--cpu_only"]],
-        ["jax with custom objective subpoints 5 cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "5", "--cpu_only"]],
-        ["tensorflow with custom objective subpoints 5 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "5", "--cpu_only"]],
+        ["jax with custom objective subpoints 5 cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "5","--additional_objective_weight", "0.25",  "--cpu_only"]],
+        ["tensorflow with custom objective subpoints 5 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "5","--additional_objective_weight", "0.25",  "--cpu_only"]],
 
         ["tensorflow only target subpoints 10 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "10", "--cpu_only"]],
         ["jax only target subpoints 10 cpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "10", "--cpu_only"]],
-        ["jax with custom objective subpoints 10 cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "10", "--cpu_only"]],
-        ["tensorflow with custom objective subpoints 10 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "10", "--cpu_only"]],
+        ["jax with custom objective subpoints 10 cpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "10","--additional_objective_weight", "0.25",  "--cpu_only"]],
+        ["tensorflow with custom objective subpoints 10 cpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "10","--additional_objective_weight", "0.25",  "--cpu_only"]],
 
         ["tensorflow only target subpoints 5 gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "5"]],
         ["jax only target subpoints 5 gpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "5"]],
-        ["jax with custom objective subpoints 5 gpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "5"]],
-        ["tensorflow with custom objective subpoints 5 gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "5"]],
+        ["jax with custom objective subpoints 5 gpu", "ik_jax.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "5"]],
+        ["tensorflow with custom objective subpoints 5 gpu", "ik_tensorflow.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "5"]],
 
         ["tensorflow only target subpoints 10 gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "10"]],
         ["jax only target subpoints 10 gpu", "ik_jax.py", ["--target_points", targets_str, "--additional_objective_weight", "0.0", "--subpoints", "10"]],
-        ["jax with custom objective subpoints 10 gpu", "ik_jax.py", ["--target_points", targets_str, "--subpoints", "10"]],
-        ["tensorflow with custom objective subpoints 10 gpu", "ik_tensorflow.py", ["--target_points", targets_str, "--subpoints", "10"]],
+        ["jax with custom objective subpoints 10 gpu", "ik_jax.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "10"]],
+        ["tensorflow with custom objective subpoints 10 gpu", "ik_tensorflow.py", ["--target_points", targets_str,"--additional_objective_weight", "0.25",  "--subpoints", "10"]],
     ]
-    #
-    num_runs = 1  # Number of times to run each implementation
+
     all_results = {}
 
     for name, script, args in implementations:
         print(f"\n=== Testing {name} ===")
         ret = []
-        for _ in range(num_runs):
-            out = run_script_full(script, args)
-            #print average statistics
-            time_taken = np.mean([o[1] for o in out])
-            avg_time_per_iteration = np.mean([o[2] for o in out])
-            avg_iterations = np.mean([o[3] for o in out])
-            success_rate = np.mean([o[4] for o in out])
-            print("----------------------------")
-            print(f"Average time taken: {time_taken:.8f} seconds")
-            print(f"Average time per iteration: {avg_time_per_iteration:.8f} seconds")
-            print(f"Average total iterations: {avg_iterations:.8f}")
-            print(f"Average success rate: {success_rate:.8f}")
-
-            ret.append(out)
+        ret.append(run_script_full(script, args))
         all_results[name] = ret
 
         # Save performance results
-        output_file = "performance_results_ipopt.json"
+        output_file = "performance_results_subpoints.json"
         with open(output_file, "w") as f:
             json.dump(all_results, f, indent=4)
 

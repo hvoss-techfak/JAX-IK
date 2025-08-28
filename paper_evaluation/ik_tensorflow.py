@@ -114,8 +114,6 @@ def _compute_fk_tf(local_array, parent_indices, default_rotations, controlled_in
     _, final_carry = tf.while_loop(cond, body, [i, carry], maximum_iterations=n)
     return final_carry
 
-
-
 def distance_obj_traj(bone_name, use_head=False, weight=1.0):
     def obj(X, fksolver, target_point):
         config = X if len(tf.shape(X)) == 1 else X[-1]
@@ -289,9 +287,6 @@ def solve_ik(target_point, init_rot, lower_bounds, upper_bounds, objective_funct
         return tf.reshape(best_x, [T, D]), best_obj, num_steps
 
 
-# =============================================================================
-# Forward Kinematics and Inverse Kinematics Solver Classes (TensorFlow version)
-# =============================================================================
 class FKSolver:
     """
     Forward kinematics solver.
@@ -464,7 +459,7 @@ def main():
                help="Learning rate for the solver.")
     parser.add("--max_iterations", type=int, default=500,
                help="Maximum iterations for each solver call.")
-    parser.add("--additional_objective_weight", type=float, default=0,
+    parser.add("--additional_objective_weight", type=float, default=0.25,
                help="Additional objective weight used in the objective functions.")
     parser.add("--subpoints", type=int, default=0,
                help="Number of subpoints for trajectory IK (0 for single configuration IK).")
@@ -557,7 +552,7 @@ def main():
             subpoints=args.subpoints
         )
         avg_steps += steps
-        if i > 0:
+        if i > 10:
             print(f"Time for iteration {i}: {time.time() - time_iter:.4f} seconds. Steps: {steps}. Success: {obj < args.threshold}")
 
         if i == 10:

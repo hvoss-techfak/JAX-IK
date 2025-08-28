@@ -626,7 +626,6 @@ def main():
         obj_fns.append(look_at_obj_traj(bone_name=f"{hand}_wrist", use_head=False, modifications=[(1, 1.0)], weight=additional_objective_weight / 3))
         obj_fns.append(look_at_obj_traj(bone_name=f"{hand}_index3_look", use_head=False, modifications=[(2, 1.0)], weight=additional_objective_weight / 3))
         obj_fns.append(look_at_obj_traj(bone_name=f"{hand}_shoulder", use_head=False, modifications=[(2, -1.0)], weight=(0.002 * additional_objective_weight) / 3))
-    # When a trajectory is used (i.e. subpoints > 0), add smoothness and initial–pose objectives.
     if args.subpoints > 0:
         obj_fns.append(velocity_obj(weight=1e-3))
         obj_fns.append(acceleration_obj(weight=1e-3))

@@ -29,3 +29,7 @@ python timing_ablation.py
 Please note that this will run all IK algorithms in all configurations 1010 times (10 warmup + 1000 evaluations) and save the results to json files. \
 THIS WILL TAKE 10+ HOURS TO COMPLETE. \
 At the end of the evaluation, the functions will automatically plot the results
+
+This is the result of the evaluation, showing the average time taken by each IK algorithm in different configurations. As you can see with the newest version of Jax, the jax implementation is now significantly faster than the newest tensorflow version. \
+This was calculated with Jax 0.6.2 and Tensorflow 2.19.0
+![table_all.png](table_all.png)
