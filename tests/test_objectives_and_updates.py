@@ -1,21 +1,21 @@
+import jax.numpy as jnp
 import numpy as np
 import pytest
-import jax.numpy as jnp
-from jax_ik.smplx_statics import left_arm_bounds_dict
 
 from jax_ik.objectives import (
-    DistanceObjTraj,
-    BoneRelativeLookObj,
-    DerivativeObj,
-    CombinedDerivativeObj,
-    InitPoseObj,
-    EqualDistanceObj,
-    SphereCollisionPenaltyObjTraj,
     BoneDirectionObjective,
+    BoneRelativeLookObj,
     BoneZeroRotationObj,
+    CombinedDerivativeObj,
+    DerivativeObj,
+    DistanceObjTraj,
+    EqualDistanceObj,
+    InitPoseObj,
     SDFCollisionPenaltyObj,
     SDFSelfCollisionPenaltyObj,
+    SphereCollisionPenaltyObjTraj,
 )
+from jax_ik.smplx_statics import left_arm_bounds_dict
 
 
 @pytest.fixture()

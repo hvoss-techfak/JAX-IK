@@ -1,5 +1,7 @@
 # JAX-IK
-Official implementation for the paper: "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters" 
+
+Official implementation for the paper: "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of
+Virtual Human Characters"
 
 [More Information](https://hvoss-techfak.github.io/TF-JAX-IK/)
 
@@ -10,15 +12,18 @@ You can try out the JAX-IK library in this [demo app](https://huggingface.co/spa
 # Install
 
 You can install the library simply using pip:
+
 ```bash
 pip install jax-ik
 ```
 
-# Example code 
+# Example code
 
 This is a small example code to solve the arm position on the smplx skeleton. \
-Sadly, we don't have the rights to add the SMPL-X skeleton to this repository. Therefore, you will have to obtain a .glb file of the smplx skeleton yourself. \
-For this install the [smplx blender addon](https://github.com/Meshcapade/SMPL_blender_addon) in blender, press on the "add" button in the Blender SMPL-X drawer. \
+Sadly, we don't have the rights to add the SMPL-X skeleton to this repository. Therefore, you will have to obtain a .glb
+file of the smplx skeleton yourself. \
+For this install the [smplx blender addon](https://github.com/Meshcapade/SMPL_blender_addon) in blender, press on the "
+add" button in the Blender SMPL-X drawer. \
 Finally, go to File -> Export -> glTF 2.0 and follow the export dialog to save your .glb file.
 
 ```python
@@ -87,4 +92,8 @@ ik_solver.render(angle_vector=solved_angles[-1], target_pos=[random_target], int
 More examples, and some open source models will be added in the following weeks.
 
 # LICENSE
-<a href="https://github.com/hvoss-techfak/TF-JAX-IK">Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters</a> © 2025 by <a href="https://github.com/hvoss-techfak">Hendric Voss</a> is licensed under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a><img src="https://mirrors.creativecommons.org/presskit/icons/cc.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/by.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/nc.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/sa.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;">
+
+<a href="https://github.com/hvoss-techfak/TF-JAX-IK">Real-Time Inverse Kinematics for Generating Multi-Constrained
+Movements of Virtual Human Characters</a> © 2025 by <a href="https://github.com/hvoss-techfak">Hendric Voss</a> is
+licensed under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA
+4.0</a><img src="https://mirrors.creativecommons.org/presskit/icons/cc.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/by.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/nc.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/sa.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;">

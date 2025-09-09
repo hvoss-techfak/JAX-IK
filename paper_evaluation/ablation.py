@@ -1,16 +1,15 @@
 import json
 import time
-
-import configargparse
-import numpy as np
 from functools import partial
 
+import configargparse
 import jax
 import jax.numpy as jnp
+import numpy as np
+from helper import load_skeleton_from_gltf
 from tqdm import tqdm
 from vedo import Line, Sphere, show
 
-from helper import load_skeleton_from_gltf
 
 @jax.jit
 def jitted_euler_to_matrix(angles):

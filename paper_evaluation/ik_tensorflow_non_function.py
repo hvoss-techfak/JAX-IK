@@ -3,12 +3,9 @@ import time
 
 import configargparse
 import numpy as np
-
 import tensorflow as tf
-
-from vedo import Line, Sphere, show
-
 from helper import load_skeleton_from_gltf
+from vedo import Line, Sphere, show
 
 
 def tf_euler_to_matrix(angles):

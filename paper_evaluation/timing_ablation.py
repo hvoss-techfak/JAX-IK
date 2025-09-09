@@ -1,14 +1,20 @@
-import subprocess
-import re
 import json
-from concurrent.futures.process import ProcessPoolExecutor
-import numpy as np
 import os
+import re
+import subprocess
+from concurrent.futures.process import ProcessPoolExecutor
 
+import numpy as np
+from plot import (
+    create_gpu_cpu_latex_table,
+    plot_cpu_gpu_comparison,
+    plot_results,
+    plot_success_rate,
+    plot_time_per_iteration,
+    print_latex_table,
+)
 from sklearn.cluster import KMeans
 from tqdm import tqdm
-
-from plot import plot_results, plot_time_per_iteration, plot_success_rate, print_latex_table, plot_cpu_gpu_comparison, create_gpu_cpu_latex_table
 
 SUCCESSFUL_TARGETS_FILE = "successful_targets.json"
 NUM_PROCESSES = 24  # Adjust based on system capabilities

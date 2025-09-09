@@ -1,8 +1,9 @@
 import os
 import sys
+import urllib.request
+
 import numpy as np
 import pytest
-import urllib.request
 
 # Ensure local src/ is importable
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

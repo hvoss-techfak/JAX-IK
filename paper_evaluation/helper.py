@@ -1,7 +1,8 @@
 import numpy as np
-from pygltflib import GLTF2
+
 # We add trimesh for loading and processing the mesh.
 import trimesh
+from pygltflib import GLTF2
 
 
 def load_mesh_colliders(gltf_file):

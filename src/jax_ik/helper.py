@@ -1,9 +1,8 @@
-import numpy as np
-from pygltflib import GLTF2
 import jax.numpy as jnp
-import urchin
+import numpy as np
 import trimesh
-from scipy.ndimage import map_coordinates
+import urchin
+from pygltflib import GLTF2
 
 
 def compute_sdf(mesh: trimesh.Trimesh, resolution: int = 64) -> dict:
@@ -47,9 +46,9 @@ def compute_sdf(mesh: trimesh.Trimesh, resolution: int = 64) -> dict:
     except ImportError:
         print("Warning: 'mesh-to-sdf' not found. Falling back to slower 'trimesh' implementation.")
         print("For better performance, please install it: pip install mesh-to-sdf")
-        print(f"Creating ProximityQuery for SDF computation...")
+        print("Creating ProximityQuery for SDF computation...")
         proximity_query = trimesh.proximity.ProximityQuery(mesh)
-        print(f"Computing signed distance field. This can take some time...")
+        print("Computing signed distance field. This can take some time...")
         signed_distance = proximity_query.signed_distance(grid_points)
 
     sdf_grid = signed_distance.reshape(resolution, resolution, resolution)

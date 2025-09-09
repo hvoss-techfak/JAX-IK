@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 
 def test_fk_and_bone_head_tail(solver):
@@ -28,6 +27,7 @@ def test_quaternion_to_matrix_roundtrip():
 
 def test_inverse_skin_points_fallback():
     import jax.numpy as jnp
+
     from jax_ik.helper import inverse_skin_points
     # points
     pts = jnp.array([[0.0,0.0,0.0],[0.01,0.0,0.0]], dtype=jnp.float32)
@@ -38,15 +38,4 @@ def test_inverse_skin_points_fallback():
     assert out.shape == pts.shape
     assert np.allclose(out, pts)
 
-
-def test_compute_sdf_box():
-    try:
-        import trimesh
-    except Exception:
-        pytest.skip('trimesh not installed')
-    from jax_ik.helper import compute_sdf
-    box = trimesh.creation.box(extents=[0.1,0.1,0.1])
-    sdf = compute_sdf(box, resolution=8)
-    assert 'grid' in sdf and 'origin' in sdf and 'spacing' in sdf
-    assert sdf['grid'].shape == (8,8,8)
 

@@ -1,13 +1,11 @@
 import json
 import time
+
 import configargparse
 import numpy as np
-
 from cyipopt import Problem as IpoptProblem
-
-from vedo import Line, Sphere, show
-
 from helper import load_skeleton_from_gltf
+from vedo import Line, Sphere, show
 
 
 def euler_to_matrix(angles):

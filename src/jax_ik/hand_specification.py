@@ -1,7 +1,11 @@
 import numpy as np
 
-from jax_ik.smplx_statics import get_pointing_pose, get_shaping_pose, get_flat_pose
-from jax_ik.objectives import InitPoseObj, BoneDirectionObjective, SDFSelfCollisionPenaltyObj
+from jax_ik.objectives import (
+    BoneDirectionObjective,
+    InitPoseObj,
+    SDFSelfCollisionPenaltyObj,
+)
+from jax_ik.smplx_statics import get_flat_pose, get_pointing_pose, get_shaping_pose
 
 
 def getPoseMask(pose_dict: dict, controlled_bones: list) -> np.ndarray:

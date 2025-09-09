@@ -1,25 +1,30 @@
 import json
 import os
+import pathlib
 import time
 from functools import partial
-import pathlib
 
 import configargparse
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.tree_util import register_pytree_node_class
 import pyvista as pv
+from jax.tree_util import register_pytree_node_class
 from tqdm import tqdm
 
-from jax_ik.helper import deform_mesh, load_mesh_data_from_gltf, load_mesh_data_from_urdf, compute_sdf
-
-
-from jax_ik.helper import load_skeleton_from_gltf, load_skeleton_from_urdf
-
+from jax_ik.helper import (
+    compute_sdf,
+    deform_mesh,
+    load_mesh_data_from_gltf,
+    load_mesh_data_from_urdf,
+    load_skeleton_from_gltf,
+    load_skeleton_from_urdf,
+)
 from jax_ik.objectives import (
+    BoneZeroRotationObj,
     DistanceObjTraj,
-    ObjectiveFunction, BoneZeroRotationObj, SDFSelfCollisionPenaltyObj,
+    ObjectiveFunction,
+    SDFSelfCollisionPenaltyObj,
 )
 
 #make cache temp folder

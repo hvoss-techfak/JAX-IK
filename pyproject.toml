@@ -4,27 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-ik"
-version="0.1.5"
+version = "0.1.5"
 description = "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters"
 authors = [{ name = "Hendric Voss", email = "hvoss@techfak.uni-bielefeld.de" }]
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "CC BY-NC-SA 4.0" }
 dependencies = [
-  "numpy>=1.19.0",
-  "jax>=0.6.2",
-  "jax-cuda12-plugin",
-  "configargparse>=1.7",
-  "pyvista>=0.45.2",
-  "pygltflib>=1.16.3",
-  "urchin>=0.0.29",
-  "trimesh>=4.6.4",
-  "tqdm>=4.67.1",
-  "networkx>=3.4",
-  "rtree>=1.4.0",
-  "mesh_to_sdf>=0.0.15",
-  "trimesh"
+    "numpy>=1.19.0",
+    "jax>=0.6.2",
+    "jax-cuda12-plugin",
+    "configargparse>=1.7",
+    "pyvista>=0.45.2",
+    "pygltflib>=1.16.3",
+    "urchin>=0.0.29",
+    "trimesh>=4.6.4",
+    "tqdm>=4.67.1",
+    "networkx>=3.4",
+    "rtree>=1.4.0",
+    "mesh_to_sdf>=0.0.15",
+    "trimesh"
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }

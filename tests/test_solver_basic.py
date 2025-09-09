@@ -1,7 +1,11 @@
 import numpy as np
 
-from jax_ik.objectives import DistanceObjTraj, BoneZeroRotationObj, BoneDirectionObjective
 from jax_ik.hand_specification import HandSpecification
+from jax_ik.objectives import (
+    BoneDirectionObjective,
+    BoneZeroRotationObj,
+    DistanceObjTraj,
+)
 
 
 def test_basic_solve_runs(solver, zero_angles):
