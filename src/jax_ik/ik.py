@@ -393,11 +393,17 @@ def _solve_ik_core(
     def compute_objectives(x_full):
         mand = jnp.float32(0.0)
         for fn in mandatory_obj_fns:
-            mand += fn(x_full, fksolver)
+            mand = mand + fn(x_full, fksolver)
         opt = jnp.float32(0.0)
         for fn in optional_obj_fns:
-            opt += fn(x_full, fksolver)
-        return mand + opt, mand, opt
+            opt = opt + fn(x_full, fksolver)
+        # Stabilize: replace NaN/Inf with large finite sentinel
+        mand = jnp.nan_to_num(mand, nan=1e6, posinf=1e6, neginf=1e6)
+        opt = jnp.nan_to_num(opt, nan=1e6, posinf=1e6, neginf=1e6)
+        total = mand + opt
+        total = jnp.nan_to_num(total, nan=1e6, posinf=1e6, neginf=1e6)
+        return total, mand, opt
+
 
     def obj_free(x_free):
         x_full = X_full.at[free_indices].set(x_free)
@@ -452,9 +458,10 @@ def _solve_ik_core(
 
     def gd_cond(state):
         i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
-        # ← exactly the same stop-condition TensorFlow used
+        # Require a minimal number of iterations before allowing threshold-based early stop
+        min_thresh_iters = 5
         patience_ret = jnp.logical_and(i < num_steps, no_improve < patience)
-        threshold_ret = best_total > threshold
+        threshold_ret = jnp.logical_or(i < min_thresh_iters, best_total > threshold)
         return jnp.logical_and(patience_ret, threshold_ret)
 
     init_state = (

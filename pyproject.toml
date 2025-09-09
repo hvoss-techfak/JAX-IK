@@ -22,7 +22,8 @@ dependencies = [
   "tqdm>=4.67.1",
   "networkx>=3.4",
   "rtree>=1.4.0",
-  "mesh_to_sdf>=0.0.15"
+  "mesh_to_sdf>=0.0.15",
+  "trimesh"
 ]
 
 [tool.setuptools]

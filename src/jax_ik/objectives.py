@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta
 
 import jax
 import jax.numpy as jnp
@@ -20,22 +20,57 @@ def get_config(X: jnp.ndarray) -> jnp.ndarray:
     Returns:
         jnp.ndarray: The last configuration (D,).
     """
-    if X.shape.ndims == 1:
+    if X.ndim == 1:  # fixed: was X.shape.ndims (invalid)
         return X
     else:
         return X[-1]
 
 
 class ObjectiveFunction(metaclass=ABCMeta):
-    def update_params(self, params_dict: dict) -> None:
-        """
-        Update parameters of the objective function.
-        This method allows dynamic adjustment of the weight and next_frames.
+    def _split_fields(self):
+        """Like before but treat ints as auxiliary (static) to avoid tracer in conditionals."""
+        leaves, aux = {}, {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, bool):
+                aux[k] = v
+                continue
+            # ints considered static metadata
+            if isinstance(v, int):
+                aux[k] = v
+                continue
+            if isinstance(v, (jnp.ndarray, np.ndarray, jnp.generic, float)):
+                leaves[k] = v
+            else:
+                aux[k] = v
+        return leaves, aux
 
-        Args:
-            params_dict (dict): Dictionary of parameters to update.
+    def tree_flatten(self):
         """
-        pass
+        Flatten the objective function into its pytree representation.
+        Returns:
+            leaves (tuple): Leaf data (attributes that can change).
+            aux (tuple): Auxiliary data (non-leaf attributes).
+        """
+        leaves, aux = self._split_fields()
+        return tuple(leaves.values()), (tuple(leaves.keys()), aux)
+
+    @classmethod
+    def tree_unflatten(cls, aux, leaves):
+        """
+        Reconstruct the objective function from its pytree representation.
+        Args:
+            aux (tuple): Auxiliary data (non-leaf attributes).
+            leaves (tuple): Leaf data (attributes that can change).
+        Returns:
+            ObjectiveFunction: Reconstructed objective function instance.
+        """
+        leaf_keys, aux_dict = aux
+        obj = cls.__new__(cls)  # create without __init__
+        for k, v in zip(leaf_keys, leaves):
+            setattr(obj, k, v)
+        for k, v in aux_dict.items():
+            setattr(obj, k, v)
+        return obj
 
     def get_params(self) -> dict:
         """
@@ -44,7 +79,31 @@ class ObjectiveFunction(metaclass=ABCMeta):
         Returns:
             dict: Dictionary with the current order, weight, and next_frames.
         """
-        pass
+        leaves, aux = self._split_fields()
+        params = {}
+        for k, v in {**leaves, **aux}.items():
+            if isinstance(v, (jnp.ndarray, np.ndarray)):
+                params[k] = np.asarray(v).tolist()
+            elif isinstance(v, jnp.generic):
+                params[k] = float(v)
+            else:
+                params[k] = v
+        return params
+
+    def update_params(self, params: dict) -> None:
+        """
+        Update parameters of the objective function.
+        This method allows dynamic adjustment of the weight and next_frames.
+
+        Args:
+            params_dict (dict): Dictionary of parameters to update.
+        """
+        for k, v in params.items():
+            if hasattr(self, k):
+                cur = getattr(self, k)
+                if isinstance(cur, (jnp.ndarray, np.ndarray, jnp.generic)):
+                    v = jnp.asarray(v, jnp.float32)
+                setattr(self, k, v)
 
     def __call__(self, X: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -93,51 +152,6 @@ class DistanceObjTraj(ObjectiveFunction):
         self.weight = jnp.asarray(weight, jnp.float32)
         self._update_ratios()
 
-    def tree_flatten(self):
-        leaves = (self.target_points, self.weight, self.rat)
-        aux = (self.bone_name, self.use_head)
-        return leaves, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        bone_name, use_head = aux
-        target_points, weight, rat = leaves
-        obj = cls(bone_name, target_points, use_head, weight)
-        obj.rat = rat
-        return obj
-
-    def update_params(self, params: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            params (dict): Dictionary with keys 'bone_name', 'use_head', 'target_points', 'weight'.
-        """
-        if "bone_name" in params:
-            self.bone_name = params["bone_name"]
-        if "use_head" in params:
-            self.use_head = bool(params["use_head"])
-        if "target_points" in params:
-            pts = jnp.asarray(params["target_points"], jnp.float32)
-            self.target_points = pts[None, :] if pts.ndim == 1 else pts
-            self._update_ratios()
-        if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            bone_name=self.bone_name,
-            use_head=self.use_head,
-            target_points=np.asarray(self.target_points).tolist(),
-            weight=float(self.weight),
-        )
-
     def _update_ratios(self) -> None:
         """
         Pre-compute the fractions k/M that decide which frames to sample.
@@ -165,6 +179,7 @@ class DistanceObjTraj(ObjectiveFunction):
         """
         fk = fk_solver.compute_fk_from_angles(cfg)
         head, tail = fk_solver.get_bone_head_tail_from_fk(fk, self.bone_name)
+        # use python bool (static) so safe
         return head if self.use_head else tail
 
     # --------------------- main loss ----------------------------------------
@@ -196,6 +211,7 @@ class DistanceObjTraj(ObjectiveFunction):
         return jnp.mean(jnp.square(diff)) * self.weight
 
 
+
 @register_pytree_node_class
 class BoneRelativeLookObj(ObjectiveFunction):
     """
@@ -225,53 +241,6 @@ class BoneRelativeLookObj(ObjectiveFunction):
         self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
 
         self.weight = jnp.asarray(weight, jnp.float32)
-
-    # pytree -----------------------------------------------------------------
-    def tree_flatten(self):
-        leaves = (self.mod_idx, self.mod_delta, self.weight)
-        aux = (self.bone_name, self.use_head)
-        return leaves, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        bone_name, use_head = aux
-        mod_idx, mod_delta, w = leaves
-        mods = list(zip(np.asarray(mod_idx).tolist(), np.asarray(mod_delta).tolist()))
-        return cls(bone_name, use_head, mods, w)
-
-    # API --------------------------------------------------------------------
-    def update_params(self, params: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            params (dict): Dictionary with keys 'bone_name', 'use_head', 'modifications', 'weight'.
-        """
-        if "bone_name" in params:
-            self.bone_name = params["bone_name"]
-        if "use_head" in params:
-            self.use_head = bool(params["use_head"])
-        if "modifications" in params:
-            mods = params["modifications"] or []
-            self.mod_idx = jnp.asarray([m[0] for m in mods], jnp.int32)
-            self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
-        if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        mods = list(zip(np.asarray(self.mod_idx).tolist(), np.asarray(self.mod_delta).tolist()))
-        return dict(
-            bone_name=self.bone_name,
-            use_head=self.use_head,
-            modifications=mods,
-            weight=float(self.weight),
-        )
 
     def __call__(self, X: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -307,6 +276,17 @@ class BoneRelativeLookObj(ObjectiveFunction):
         misalign = jnp.arccos(cos_th) ** 2
         return misalign * self.weight
 
+    def update_params(self, params: dict) -> None:  # custom handling for modifications
+        if 'modifications' in params:
+            mods = params['modifications'] or []
+            self.mod_idx = jnp.asarray([m[0] for m in mods], jnp.int32)
+            self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
+        if 'weight' in params:
+            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        if 'use_head' in params:
+            self.use_head = bool(params['use_head'])
+        # ignore unknown keys (no-op)
+
 
 @register_pytree_node_class
 class DerivativeObj(ObjectiveFunction):
@@ -332,51 +312,6 @@ class DerivativeObj(ObjectiveFunction):
             self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
         else:
             self.next_frames = jnp.asarray(next_frames, jnp.float32)
-
-    # pytree -----------------------------------------------------------------
-    def tree_flatten(self):
-        return (self.weight, self.next_frames), (self.order,)
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        (order,) = aux
-        w, nxt = leaves
-        obj = cls(order, w)
-        obj.next_frames = nxt
-        return obj
-
-    # API --------------------------------------------------------------------
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'order', 'weight', 'next_frames'.
-        """
-        if "order" in p:
-            if p["order"] not in (1, 2, 3):
-                raise ValueError("order must be 1, 2 or 3")
-            self.order = int(p["order"])
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], jnp.float32)
-        if "next_frames" in p:
-            if p["next_frames"] is None:
-                self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
-            else:
-                self.next_frames = jnp.asarray(p["next_frames"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            order=self.order,
-            weight=float(self.weight),
-            next_frames=np.asarray(self.next_frames) if self.next_frames.shape[0] > 0 else None,
-        )
 
     # loss -------------------------------------------------------------------
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
@@ -409,6 +344,11 @@ class DerivativeObj(ObjectiveFunction):
             diff = traj[3:] - 3 * traj[2:-1] + 3 * traj[1:-2] - traj[:-3]
 
         return jnp.mean(jnp.square(diff)) * self.weight
+
+    def update_params(self, params: dict) -> None:
+        if 'weight' in params:
+            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        # order treated static; ignore updates
 
 
 @register_pytree_node_class
@@ -452,73 +392,6 @@ class CombinedDerivativeObj(ObjectiveFunction):
         else:
             self.next_frames = jnp.asarray(next_frames, jnp.float32)
 
-    # pytree -----------------------------------------------------------------
-    def tree_flatten(self):
-        return (self.weights, self.next_frames), (self.max_order,)
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        (max_order,) = aux
-        weights, nxt = leaves
-        obj = cls(max_order, weight=1.0, weights=weights)
-        obj.next_frames = nxt
-        return obj
-
-    # API --------------------------------------------------------------------
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'max_order', 'weight', 'weights', 'next_frames'.
-        """
-        if "max_order" in p:
-            if p["max_order"] not in (1, 2, 3):
-                raise ValueError("max_order must be 1, 2 or 3")
-            old_max_order = self.max_order
-            self.max_order = int(p["max_order"])
-            # Adjust weights array if max_order changed
-            if self.max_order != old_max_order:
-                if self.max_order > old_max_order:
-                    # Extend weights with the last weight value
-                    last_weight = self.weights[-1] if len(self.weights) > 0 else 1.0
-                    new_weights = jnp.concatenate([
-                        self.weights,
-                        jnp.full(self.max_order - old_max_order, last_weight, dtype=jnp.float32)
-                    ])
-                    self.weights = new_weights
-                else:
-                    # Truncate weights
-                    self.weights = self.weights[:self.max_order]
-
-        if "weight" in p:
-            # Set all weights to the same value
-            self.weights = jnp.full(self.max_order, p["weight"], dtype=jnp.float32)
-
-        if "weights" in p:
-            if len(p["weights"]) != self.max_order:
-                raise ValueError(f"weights must have length {self.max_order} for max_order {self.max_order}")
-            self.weights = jnp.asarray(p["weights"], jnp.float32)
-
-        if "next_frames" in p:
-            if p["next_frames"] is None:
-                self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
-            else:
-                self.next_frames = jnp.asarray(p["next_frames"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            max_order=self.max_order,
-            weights=np.asarray(self.weights).tolist(),
-            next_frames=np.asarray(self.next_frames) if self.next_frames.shape[0] > 0 else None,
-        )
-
     # loss -------------------------------------------------------------------
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
@@ -560,6 +433,13 @@ class CombinedDerivativeObj(ObjectiveFunction):
 
         return total_loss
 
+    def update_params(self, params: dict) -> None:
+        if 'weights' in params:
+            w = params['weights']
+            self.weights = jnp.asarray(w, jnp.float32)
+        elif 'weight' in params:
+            self.weights = jnp.full(self.max_order, params['weight'], dtype=jnp.float32)
+
 
 @register_pytree_node_class
 class InitPoseObj(ObjectiveFunction):
@@ -590,51 +470,6 @@ class InitPoseObj(ObjectiveFunction):
 
         self.mask = jnp.ones_like(self.init_rot) if mask is None else jnp.asarray(mask, jnp.float32).reshape(-1)
 
-    # pytree -----------------------------------------------------------------
-    def tree_flatten(self):
-        leaves = (self.init_rot, self.mask, self.weight)
-        aux = (self.full_trajectory, self.last_position)
-        return leaves, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        full_traj, last_pos = aux
-        init_rot, mask, w = leaves
-        return cls(init_rot, full_traj, last_pos, w, mask)
-
-    # API --------------------------------------------------------------------
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'init_rot', 'weight', 'mask', 'full_trajectory', 'last_position'.
-        """
-        if "init_rot" in p:
-            self.init_rot = jnp.asarray(p["init_rot"], jnp.float32).reshape(-1)
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], jnp.float32)
-        if "mask" in p:
-            self.mask = jnp.asarray(p["mask"], jnp.float32).reshape(-1)
-        if "full_trajectory" in p:
-            self.full_trajectory = bool(p["full_trajectory"])
-        if "last_position" in p:
-            self.last_position = bool(p["last_position"])
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            init_rot=np.asarray(self.init_rot),
-            full_trajectory=self.full_trajectory,
-            last_position=self.last_position,
-            weight=float(self.weight),
-            mask=np.asarray(self.mask),
-        )
 
     def _loss_single(self, pose: jnp.ndarray) -> jnp.ndarray:
         """
@@ -688,33 +523,6 @@ class EqualDistanceObj(ObjectiveFunction):
         """
         self.weight = jnp.asarray(weight, jnp.float32)
 
-    def tree_flatten(self):
-        return (self.weight,), ()
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        (w,) = leaves
-        return cls(w)
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with key 'weight'.
-        """
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(weight=float(self.weight))
-
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
         Compute the penalty for unequal spacing between consecutive poses.
@@ -762,58 +570,6 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         self.segment_radius = jnp.asarray(segment_radius, jnp.float32)
         self.weight = jnp.asarray(weight, jnp.float32)
 
-    def tree_flatten(self):
-        leaves = (
-            self.center,
-            self.radius,
-            self.min_clearance,
-            self.segment_radius,
-            self.weight,
-        )
-        return leaves, ()
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        c, r, mc, sr, w = leaves
-        return cls(dict(center=c, radius=r), w, mc, sr)
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'sphere_collider', 'center', 'radius', 'min_clearance', 'segment_radius', 'weight'.
-        """
-        if "sphere_collider" in p:
-            collider = p["sphere_collider"]
-            if "center" in collider:
-                self.center = jnp.asarray(collider["center"], jnp.float32)
-            if "radius" in collider:
-                self.radius = jnp.asarray(collider["radius"], jnp.float32)
-        if "center" in p:
-            self.center = jnp.asarray(p["center"], jnp.float32)
-        if "radius" in p:
-            self.radius = jnp.asarray(p["radius"], jnp.float32)
-        if "min_clearance" in p:
-            self.min_clearance = jnp.asarray(p["min_clearance"], jnp.float32)
-        if "segment_radius" in p:
-            self.segment_radius = jnp.asarray(p["segment_radius"], jnp.float32)
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            sphere_collider=dict(center=np.asarray(self.center).tolist(), radius=float(self.radius)),
-            min_clearance=float(self.min_clearance),
-            segment_radius=float(self.segment_radius),
-            weight=float(self.weight),
-        )
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -866,6 +622,10 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
             loss = jnp.mean(jax.vmap(lambda c: self._penalty_single(c, fk_solver))(X))
         return loss * self.weight
 
+    def update_params(self, params: dict) -> None:
+        if 'weight' in params:
+            self.weight = jnp.asarray(params['weight'], jnp.float32)
+
 
 @register_pytree_node_class
 class BoneDirectionObjective(ObjectiveFunction):
@@ -898,47 +658,6 @@ class BoneDirectionObjective(ObjectiveFunction):
             self.directions = jnp.array([[0, 1, 0]], dtype=jnp.float32)
         self.weight = jnp.asarray(weight, dtype=jnp.float32)
 
-    def tree_flatten(self):
-        return (self.directions, self.weight), (self.bone_name, self.use_head, self.raw_directions)
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        bone_name, use_head, raw_directions = aux
-        directions, w = leaves
-        # Use the stored raw_directions instead of converting JAX arrays
-        return cls(bone_name, use_head, raw_directions, w)
-
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'bone_name', 'use_head', 'directions', 'weight'.
-        """
-        if "bone_name" in p:
-            self.bone_name = p["bone_name"]
-        if "use_head" in p:
-            self.use_head = bool(p["use_head"])
-        if "directions" in p:
-            self.raw_directions = p["directions"]
-            self.directions = jnp.asarray(p["directions"], dtype=jnp.float32)
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], dtype=jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(
-            bone_name=self.bone_name,
-            use_head=self.use_head,
-            directions=self.raw_directions,
-            weight=float(self.weight),
-        )
 
     def _loss_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -1009,49 +728,13 @@ class BoneZeroRotationObj(ObjectiveFunction):
         self.weight = jnp.asarray(weight, jnp.float32)
         self.mask = jnp.ones([1], jnp.float32) if mask is None else jnp.asarray(mask, jnp.float32)
 
-    def tree_flatten(self):
-        return (self.weight, self.mask), ()
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        w, m = leaves
-        return cls(w, m)
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'weight', 'mask'.
-        """
-        if "weight" in p:
-            self.weight = jnp.asarray(p["weight"], jnp.float32)
-        if "mask" in p:
-            self.mask = jnp.asarray(p["mask"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return dict(weight=float(self.weight), mask=np.asarray(self.mask))
-
-    def _masked_sq_norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute the masked mean squared norm of x.
-
-        Args:
-            x (jnp.ndarray): Input array.
-
-        Returns:
-            jnp.ndarray: Masked mean squared norm.
-        """
-        #if mask is shape (1,) then it is applied to every element of x
-        if self.mask.ndim == 1 and self.mask.shape[0] == 1:
-            return jnp.mean(jnp.square(x)) * self.mask[0]
-        return jnp.mean(jnp.square(x * self.mask))
+    def _masked_sq_norm(self, pose: jnp.ndarray) -> jnp.ndarray:
+        """Compute masked squared norm of a single pose (mean over dims)."""
+        if self.mask.size == 1:
+            diff = pose * self.mask[0]
+        else:
+            diff = pose * self.mask
+        return jnp.mean(jnp.square(diff))
 
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
@@ -1093,51 +776,6 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         self.sdf_grid = sdf["grid"]
         self.sdf_origin = sdf["origin"]
         self.sdf_spacing = sdf["spacing"]
-
-    def tree_flatten(self):
-        leaves = (self.weight, self.sdf_grid, self.sdf_origin, self.sdf_spacing)
-        aux = (self.bone_name, self.num_samples)
-        return leaves, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        bone_name, num_samples = aux
-        weight, grid, origin, spacing = leaves
-        sdf = {"grid": grid, "origin": origin, "spacing": spacing}
-        return cls(bone_name, sdf, num_samples, weight)
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'bone_name', 'num_samples', 'weight', 'sdf'.
-        """
-        if "bone_name" in p: self.bone_name = p["bone_name"]
-        if "num_samples" in p: self.num_samples = int(p["num_samples"])
-        if "weight" in p: self.weight = jnp.asarray(p["weight"], jnp.float32)
-        if "sdf" in p:
-            self.sdf_grid = p["sdf"]["grid"]
-            self.sdf_origin = p["sdf"]["origin"]
-            self.sdf_spacing = p["sdf"]["spacing"]
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return {
-            "bone_name": self.bone_name,
-            "num_samples": self.num_samples,
-            "weight": float(self.weight),
-            "sdf": {
-                "grid": np.asarray(self.sdf_grid),
-                "origin": np.asarray(self.sdf_origin),
-                "spacing": float(self.sdf_spacing),
-            },
-        }
 
     def _get_sdf_value(self, points: jnp.ndarray) -> jnp.ndarray:
         """
@@ -1190,6 +828,10 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         losses = jax.vmap(lambda c: self._penalty_single(c, fk_solver))(X)
         return jnp.mean(losses) * self.weight
 
+    def update_params(self, params: dict) -> None:
+        if 'weight' in params:
+            self.weight = jnp.asarray(params['weight'], jnp.float32)
+
 
 @register_pytree_node_class
 class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
@@ -1215,43 +857,6 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         self.num_samples_per_bone = int(num_samples_per_bone)
         self.min_dist = jnp.float32(min_dist)
         self.weight = jnp.asarray(weight, jnp.float32)
-
-    def tree_flatten(self):
-        leaves = (self.min_dist, self.weight)
-        aux = (self.bone_names, self.num_samples_per_bone)
-        return leaves, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, leaves):
-        bone_names, num_samples = aux
-        min_dist, weight = leaves
-        return cls(bone_names, num_samples, min_dist, weight)
-
-    def update_params(self, p: dict) -> None:
-        """
-        Update the parameters of the objective.
-
-        Args:
-            p (dict): Dictionary with keys 'bone_names', 'num_samples_per_bone', 'min_dist', 'weight'.
-        """
-        if "bone_names" in p: self.bone_names = tuple(p["bone_names"])
-        if "num_samples_per_bone" in p: self.num_samples_per_bone = int(p["num_samples_per_bone"])
-        if "min_dist" in p: self.min_dist = jnp.float32(p["min_dist"])
-        if "weight" in p: self.weight = jnp.asarray(p["weight"], jnp.float32)
-
-    def get_params(self) -> dict:
-        """
-        Get the current parameters of the objective.
-
-        Returns:
-            dict: Dictionary of parameters.
-        """
-        return {
-            "bone_names": self.bone_names,
-            "num_samples_per_bone": self.num_samples_per_bone,
-            "min_dist": float(self.min_dist),
-            "weight": float(self.weight),
-        }
 
     def _get_sdf_value(self, points: jnp.ndarray, sdf: dict) -> jnp.ndarray:
         """
@@ -1323,3 +928,8 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         losses = jax.vmap(lambda c: self._penalty_single(c, fk_solver))(X)
         return jnp.mean(losses) * self.weight
 
+    def update_params(self, params: dict) -> None:
+        if 'weight' in params:
+            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        if 'min_dist' in params:
+            self.min_dist = jnp.float32(params['min_dist'])
