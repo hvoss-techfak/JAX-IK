@@ -3,7 +3,7 @@
 Official implementation for the paper: "Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of
 Virtual Human Characters"
 
-[More Information](https://hvoss-techfak.github.io/TF-JAX-IK/)
+[More Information](https://hvoss-techfak.github.io/JAX-IK/)
 
 # Demo
 
