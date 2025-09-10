@@ -16,6 +16,7 @@ from jax_ik.smplx_statics import left_arm_bounds_dict  # added
 SMPLX_FILENAME = "smplx.glb"
 SMPLX_URL = "https://uni-bielefeld.sciebo.de/s/B5StwQdiR4DW5mc/download"
 
+
 def _ensure_smplx_model(path: str):
     """Ensure smplx.glb exists; attempt download if missing.
     Skips tests gracefully if download fails.
@@ -37,18 +38,23 @@ def _ensure_smplx_model(path: str):
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"{SMPLX_FILENAME} not available and download failed: {e}")
 
+
 # Central model path fixture
 @pytest.fixture(scope="session")
 def model_path():
     path = os.path.abspath(os.path.join(PROJECT_ROOT, SMPLX_FILENAME))
     _ensure_smplx_model(path)
     if not os.path.exists(path):
-        pytest.skip(f"{SMPLX_FILENAME} not available – skipping IK tests that need real model")
+        pytest.skip(
+            f"{SMPLX_FILENAME} not available – skipping IK tests that need real model"
+        )
     return path
+
 
 @pytest.fixture(scope="session")
 def basic_controlled_bones():
     return ["left_collar", "left_shoulder", "left_elbow", "left_wrist"]
+
 
 @pytest.fixture(scope="session")
 def angle_dim(basic_controlled_bones):
@@ -61,16 +67,19 @@ def _build_bounds(controlled_bones):
         if bone not in left_arm_bounds_dict:
             raise KeyError(f"Bone {bone} not found in left_arm_bounds_dict")
         lower, upper = left_arm_bounds_dict[bone]
-        for l,u in zip(lower, upper):
+        for l, u in zip(lower, upper):
             bounds.append((l, u))  # degrees; solver converts to radians
     return bounds
+
 
 @pytest.fixture(scope="session")
 def solver(model_path, basic_controlled_bones):
     try:
         from jax_ik.ik import InverseKinematicsSolver
     except Exception as e:  # noqa: BLE001
-        pytest.skip(f"Cannot import InverseKinematicsSolver (maybe optional dep missing like pyvista): {e}")
+        pytest.skip(
+            f"Cannot import InverseKinematicsSolver (maybe optional dep missing like pyvista): {e}"
+        )
     bounds = _build_bounds(basic_controlled_bones)
     solver = InverseKinematicsSolver(
         model_file=model_path,
@@ -82,9 +91,11 @@ def solver(model_path, basic_controlled_bones):
     )
     return solver
 
+
 @pytest.fixture()
 def zero_angles(angle_dim):
     return np.zeros(angle_dim, dtype=np.float32)
+
 
 @pytest.fixture()
 def two_frame_traj(zero_angles):

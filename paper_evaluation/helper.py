@@ -63,9 +63,21 @@ def get_node_transform(node):
     if node.matrix is not None and any(node.matrix):
         return np.array(node.matrix, dtype=np.float32).reshape((4, 4)).T
     else:
-        t = np.array(node.translation, dtype=np.float32) if node.translation is not None else np.zeros(3, dtype=np.float32)
-        r = np.array(node.rotation, dtype=np.float32) if node.rotation is not None else np.array([0, 0, 0, 1], dtype=np.float32)
-        s = np.array(node.scale, dtype=np.float32) if node.scale is not None else np.ones(3, dtype=np.float32)
+        t = (
+            np.array(node.translation, dtype=np.float32)
+            if node.translation is not None
+            else np.zeros(3, dtype=np.float32)
+        )
+        r = (
+            np.array(node.rotation, dtype=np.float32)
+            if node.rotation is not None
+            else np.array([0, 0, 0, 1], dtype=np.float32)
+        )
+        s = (
+            np.array(node.scale, dtype=np.float32)
+            if node.scale is not None
+            else np.ones(3, dtype=np.float32)
+        )
         T = np.eye(4, dtype=np.float32)
         T[:3, 3] = t
         R = quaternion_to_matrix(r)
@@ -102,7 +114,11 @@ def load_skeleton_from_gltf(gltf_file):
         if node.children:
             for child_index in node.children:
                 child_node = gltf.nodes[child_index]
-                child_name = child_node.name if child_node.name is not None else f"bone_{child_index}"
+                child_name = (
+                    child_node.name
+                    if child_node.name is not None
+                    else f"bone_{child_index}"
+                )
                 bone["children"].append(child_name)
                 build_bone(child_index, bone_name)
 
@@ -134,4 +150,3 @@ def load_skeleton_from_gltf(gltf_file):
 
     skeleton = {bone["name"]: bone for bone in bones_by_index.values()}
     return skeleton
-

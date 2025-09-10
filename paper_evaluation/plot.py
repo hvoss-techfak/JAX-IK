@@ -17,7 +17,7 @@ def plot_success_rate(all_results, output_filename):
                 # Use index 4 for success (based on tuple: (iteration, time, time_per_iteration, steps, success))
                 for m in measurement:
                     if m[4] is not None:
-                        sr_list.append(m[4]*100)
+                        sr_list.append(m[4] * 100)
         if sr_list:
             mean_sr = np.mean(sr_list)
             std_sr = np.std(sr_list)
@@ -30,29 +30,22 @@ def plot_success_rate(all_results, output_filename):
     x_pos = list(range(len(alg_names)))
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_pos,
-        y=mean_values,
-        error_y=dict(
-            type='data',
-            array=std_values,
-            visible=True
-        ),
-        marker_color='lightskyblue'
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=x_pos,
+            y=mean_values,
+            error_y=dict(type="data", array=std_values, visible=True),
+            marker_color="lightskyblue",
+        )
+    )
 
     fig.update_layout(
         title="Success Rate (Combined Conditions)",
         xaxis=dict(
-            title="Algorithm",
-            tickmode='array',
-            tickvals=x_pos,
-            ticktext=alg_names
+            title="Algorithm", tickmode="array", tickvals=x_pos, ticktext=alg_names
         ),
-        yaxis=dict(
-            title="Mean Success Rate"
-        ),
-        margin=dict(l=20, r=20, t=40, b=20)
+        yaxis=dict(title="Mean Success Rate"),
+        margin=dict(l=20, r=20, t=40, b=20),
     )
 
     fig.write_image(output_filename)
@@ -81,39 +74,33 @@ def plot_results(all_results, condition, output_filename):
             stats[name] = (mean_time, std_time)
 
     sorted_stats = sorted(stats.items(), key=lambda x: x[1][0])
-    alg_names = [x[0].replace(" only target","").replace(" with custom objective","") for x in sorted_stats]
+    alg_names = [
+        x[0].replace(" only target", "").replace(" with custom objective", "")
+        for x in sorted_stats
+    ]
     mean_times = [x[1][0] for x in sorted_stats]
     std_times = [x[1][1] for x in sorted_stats]
     x_pos = list(range(len(alg_names)))
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_pos,
-        y=mean_times,
-        error_y=dict(
-            type='data',
-            array=std_times,
-            visible=True
-        ),
-        marker_color='lightskyblue'
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=x_pos,
+            y=mean_times,
+            error_y=dict(type="data", array=std_times, visible=True),
+            marker_color="lightskyblue",
+        )
+    )
     fig.add_hline(y=0.033333333, line_width=1, line_dash="dash", line_color="black")
 
     fig.update_layout(
-        xaxis=dict(
-            tickmode='array',
-            tickvals=x_pos,
-            ticktext=alg_names
-        ),
-        yaxis=dict(
-            title="Mean Time per solve (seconds)"
-        ),
+        xaxis=dict(tickmode="array", tickvals=x_pos, ticktext=alg_names),
+        yaxis=dict(title="Mean Time per solve (seconds)"),
         margin=dict(l=20, r=20, t=40, b=20),
+        yaxis_range=[0, 0.01],
     )
-
     fig.write_image(output_filename)
     print(f"Plot saved as {output_filename}")
-
 
 
 def plot_cpu_gpu_comparison(all_results, output_filename):
@@ -121,8 +108,8 @@ def plot_cpu_gpu_comparison(all_results, output_filename):
     Create a bar plot comparing CPU vs GPU performance for TensorFlow and JAX,
     based on average time per iteration (measurement[2]).
     """
-    implementations = ['tensorflow', 'jax']
-    devices = ['cpu', 'gpu']
+    implementations = ["tensorflow", "jax"]
+    devices = ["cpu", "gpu"]
 
     stats = {}
     for impl in implementations:
@@ -147,40 +134,33 @@ def plot_cpu_gpu_comparison(all_results, output_filename):
     x_pos = list(range(len(labels)))
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_pos,
-        y=mean_times,
-        error_y=dict(
-            type='data',
-            array=std_times,
-            visible=True
-        ),
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=x_pos,
+            y=mean_times,
+            error_y=dict(type="data", array=std_times, visible=True),
+        )
+    )
 
     fig.update_layout(
         title="CPU vs GPU Performance (Avg. Time per Iteration)",
-        xaxis=dict(
-            tickmode='array',
-            tickvals=x_pos,
-            ticktext=labels
-        ),
-        yaxis=dict(
-            title="Mean Time per Iteration (seconds)"
-        ),
+        xaxis=dict(tickmode="array", tickvals=x_pos, ticktext=labels),
+        yaxis=dict(title="Mean Time per Iteration (seconds)"),
         margin=dict(l=20, r=20, t=40, b=20),
-        yaxis_range=[0, 0.01]
+        yaxis_range=[0, 0.01],
     )
 
     fig.write_image(output_filename)
     print(f"Comparison plot saved as {output_filename}")
+
 
 def create_gpu_cpu_latex_table(all_results):
     """
     Create a LaTeX formatted table summarizing CPU and GPU performance comparisons
     for TensorFlow and JAX implementations based on average time per iteration.
     """
-    implementations = ['tensorflow', 'jax']
-    devices = ['cpu', 'gpu']
+    implementations = ["tensorflow", "jax"]
+    devices = ["cpu", "gpu"]
 
     table = "\\begin{tabular}{lcc}\n"
     table += "\\hline\\hline\n"
@@ -201,13 +181,16 @@ def create_gpu_cpu_latex_table(all_results):
                 std_time = np.std(times)
                 impl = impl.replace("tensorflow", "TensorFlow").replace("jax", "Jax")
                 impl = impl.replace("fabrik", "FABRIK").replace("ccd", "CCD")
-                impl = impl.replace(" only target", "").replace(" with custom objective", "")
+                impl = impl.replace(" only target", "").replace(
+                    " with custom objective", ""
+                )
                 table += f"{impl.capitalize()} & {device.upper()} & {mean_time:.4f} $\\pm$ {std_time:.4f} \\ \\n"
 
     table += "\\hline\\hline\n"
     table += "\\end{tabular}"
 
     print(table)
+
 
 def plot_time_per_iteration(all_results, output_filename, significance_threshold=0.05):
     """
@@ -233,7 +216,9 @@ def plot_time_per_iteration(all_results, output_filename, significance_threshold
         for run in runs:
             for measurements in run:
                 for measurement in measurements:
-                    iteration_num, time_taken,time_per_iteration, steps, success = measurement
+                    iteration_num, time_taken, time_per_iteration, steps, success = (
+                        measurement
+                    )
                     tpi_list.append(time_per_iteration)
         if tpi_list:
             # If the algorithm already exists (e.g. from multiple runs), extend the list.
@@ -254,16 +239,14 @@ def plot_time_per_iteration(all_results, output_filename, significance_threshold
 
     # Create Plotly bar chart with error bars.
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_pos,
-        y=mean_values,
-        error_y=dict(
-            type='data',
-            array=std_values,
-            visible=True
-        ),
-        marker_color='lightskyblue'
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=x_pos,
+            y=mean_values,
+            error_y=dict(type="data", array=std_values, visible=True),
+            marker_color="lightskyblue",
+        )
+    )
 
     # Compare the best-performing algorithm (first bar) with each other algorithm.
     reference = alg_names[0]
@@ -284,13 +267,13 @@ def plot_time_per_iteration(all_results, output_filename, significance_threshold
 
         # Determine significance stars.
         if p_val < 0.001:
-            stars = '***'
+            stars = "***"
         elif p_val < 0.01:
-            stars = '**'
+            stars = "**"
         elif p_val < significance_threshold:
-            stars = '*'
+            stars = "*"
         else:
-            stars = 'ns'
+            stars = "ns"
 
         # Determine the vertical position for the significance line.
         y_ref = mean_values[0] + std_values[0]
@@ -303,59 +286,63 @@ def plot_time_per_iteration(all_results, output_filename, significance_threshold
         x1 = i
 
         # Draw horizontal line.
-        shapes.append(dict(
-            type="line",
-            xref="x",
-            yref="y",
-            x0=x0,
-            x1=x1,
-            y0=y_line,
-            y1=y_line,
-            line=dict(color="black", width=1)
-        ))
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x0,
+                x1=x1,
+                y0=y_line,
+                y1=y_line,
+                line=dict(color="black", width=1),
+            )
+        )
         # Draw vertical ticks at each end.
-        shapes.append(dict(
-            type="line",
-            xref="x",
-            yref="y",
-            x0=x0,
-            x1=x0,
-            y0=y_line,
-            y1=y_line - offset / 2,
-            line=dict(color="black", width=1)
-        ))
-        shapes.append(dict(
-            type="line",
-            xref="x",
-            yref="y",
-            x0=x1,
-            x1=x1,
-            y0=y_line,
-            y1=y_line - offset / 2,
-            line=dict(color="black", width=1)
-        ))
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x0,
+                x1=x0,
+                y0=y_line,
+                y1=y_line - offset / 2,
+                line=dict(color="black", width=1),
+            )
+        )
+        shapes.append(
+            dict(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x1,
+                x1=x1,
+                y0=y_line,
+                y1=y_line - offset / 2,
+                line=dict(color="black", width=1),
+            )
+        )
         # Place the significance stars in the middle.
-        annotations.append(dict(
-            x=(x0 + x1) / 2,
-            y=y_line + offset / 2,
-            text=stars,
-            showarrow=False,
-            font=dict(color="black", size=12)
-        ))
+        annotations.append(
+            dict(
+                x=(x0 + x1) / 2,
+                y=y_line + offset / 2,
+                text=stars,
+                showarrow=False,
+                font=dict(color="black", size=12),
+            )
+        )
 
     # Update layout with axis labels, custom tick labels, shapes, and annotations.
     fig.update_layout(
         xaxis_title="Algorithm",
         yaxis_title="Mean Time per Iteration (seconds)",
-        xaxis=dict(
-            tickmode='array',
-            tickvals=x_pos,
-            ticktext=alg_names
-        ),
+        xaxis=dict(tickmode="array", tickvals=x_pos, ticktext=alg_names),
         shapes=shapes,
         annotations=annotations,
-        margin=dict(l=20, r=20, t=20, b=20), # Adjust these values as needed
-        yaxis_range = [0, 0.0065]
+        margin=dict(l=20, r=20, t=20, b=20),  # Adjust these values as needed
+        yaxis_range=[0, 0.0065],
     )
 
     # Save the figure as an image.
@@ -389,7 +376,7 @@ Algorithm & Custom Objective & Solving Time (ms) & Iterations & Time per Iterati
         times = np.array([x[1] for x in flat_data])
 
         iterations = np.array([x[3] for x in flat_data])
-        tpis = times/iterations
+        tpis = times / iterations
         successes = np.array([x[4] for x in flat_data])
 
         mean_time = np.mean(times)
@@ -407,7 +394,7 @@ Algorithm & Custom Objective & Solving Time (ms) & Iterations & Time per Iterati
         impl = impl.replace("tensorflow", "TensorFlow").replace("jax", "Jax")
         impl = impl.replace("fabrik", "FABRIK").replace("ccd", "CCD")
         impl = impl.replace(" only target", "").replace(" with custom objective", "")
-        row = f"{impl} & {custom_obj} & {mean_time*1000:.2f} $\\pm$ {std_time*1000:.2f} & {mean_iter:.2f} $\\pm$ {std_iter:.2f} & {mean_tpi*1000:.2f} $\\pm$ {std_tpi*1000:.2f} & {mean_success*100:.2f} $\\pm$ {std_success*100:.2f} \\\\"
+        row = f"{impl} & {custom_obj} & {mean_time * 1000:.2f} $\\pm$ {std_time * 1000:.2f} & {mean_iter:.2f} $\\pm$ {std_iter:.2f} & {mean_tpi * 1000:.2f} $\\pm$ {std_tpi * 1000:.2f} & {mean_success * 100:.2f} $\\pm$ {std_success * 100:.2f} \\\\"
         print(row)
 
     footer = r"""\hline

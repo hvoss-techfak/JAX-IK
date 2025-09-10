@@ -20,18 +20,15 @@ def jitted_euler_to_matrix(angles):
     sy = jnp.sin(angles[1])
     cz = jnp.cos(angles[2])
     sz = jnp.sin(angles[2])
-    R_x = jnp.array([[1, 0, 0, 0],
-                     [0, cx, -sx, 0],
-                     [0, sx, cx, 0],
-                     [0, 0, 0, 1]], dtype=jnp.float32)
-    R_y = jnp.array([[cy, 0, sy, 0],
-                     [0, 1, 0, 0],
-                     [-sy, 0, cy, 0],
-                     [0, 0, 0, 1]], dtype=jnp.float32)
-    R_z = jnp.array([[cz, -sz, 0, 0],
-                     [sz, cz, 0, 0],
-                     [0, 0, 1, 0],
-                     [0, 0, 0, 1]], dtype=jnp.float32)
+    R_x = jnp.array(
+        [[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]], dtype=jnp.float32
+    )
+    R_y = jnp.array(
+        [[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]], dtype=jnp.float32
+    )
+    R_z = jnp.array(
+        [[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=jnp.float32
+    )
     return R_z @ R_y @ R_x
 
 
@@ -43,7 +40,7 @@ def jitted_look_at_penalty(head, tail, target_point):
     target_direction = target_direction / jnp.linalg.norm(target_direction + 1e-6)
     cos_theta = jnp.clip(jnp.dot(bone_direction, target_direction), -1.0, 1.0)
     misalignment_angle = jnp.arccos(cos_theta)
-    return misalignment_angle ** 2
+    return misalignment_angle**2
 
 
 @jax.jit
@@ -72,17 +69,22 @@ def rotation_matrix_from_axis_angle(axis, angle):
     s = jnp.sin(angle)
     t = 1 - c
     x, y, z = axis[0], axis[1], axis[2]
-    R3 = jnp.array([
-        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
-        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
-        [t * x * z - s * y, t * y * z + s * x, t * z * z + c]
-    ], dtype=jnp.float32)
+    R3 = jnp.array(
+        [
+            [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+            [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+            [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+        ],
+        dtype=jnp.float32,
+    )
     R4 = jnp.eye(4, dtype=jnp.float32).at[:3, :3].set(R3)
     return R4
 
 
 @partial(jax.jit, static_argnames=("controlled_indices",))
-def _compute_fk(local_array, parent_indices, default_rotations, controlled_indices, angle_vector):
+def _compute_fk(
+    local_array, parent_indices, default_rotations, controlled_indices, angle_vector
+):
     """
     Pure forward kinematics computation.
     """
@@ -90,7 +92,7 @@ def _compute_fk(local_array, parent_indices, default_rotations, controlled_indic
     # Replace the rotation for each controlled bone using the provided angles.
     for j, bone_idx in enumerate(controlled_indices):
         # Each controlled bone uses 3 angles.
-        angles = angle_vector[3 * j: 3 * j + 3]
+        angles = angle_vector[3 * j : 3 * j + 3]
         rotations = rotations.at[bone_idx].set(jitted_euler_to_matrix(angles))
     n = local_array.shape[0]
     init_carry = jnp.zeros((n, 4, 4), dtype=jnp.float32)
@@ -98,9 +100,7 @@ def _compute_fk(local_array, parent_indices, default_rotations, controlled_indic
     def fk_scan(carry, inputs):
         i, local_i, rotation_i, parent_idx = inputs
         parent_transform = jax.lax.select(
-            parent_idx < 0,
-            jnp.eye(4, dtype=jnp.float32),
-            carry[parent_idx]
+            parent_idx < 0, jnp.eye(4, dtype=jnp.float32), carry[parent_idx]
         )
         current = parent_transform @ local_i @ rotation_i
         carry = carry.at[i].set(current)
@@ -111,10 +111,21 @@ def _compute_fk(local_array, parent_indices, default_rotations, controlled_indic
     final_carry, _ = jax.lax.scan(fk_scan, init_carry, inputs)
     return final_carry
 
+
 @partial(jax.jit, static_argnames=("fksolver", "hand", "learning_rate"))
-def solve_single_ik(target, init_rot, lower_bounds, upper_bounds,
-                    fksolver, hand="left", known_rotations=(),
-                    threshold=0.01, num_steps=1000, learning_rate=0.1,use_custom_objective=False):
+def solve_single_ik(
+    target,
+    init_rot,
+    lower_bounds,
+    upper_bounds,
+    fksolver,
+    hand="left",
+    known_rotations=(),
+    threshold=0.01,
+    num_steps=1000,
+    learning_rate=0.1,
+    use_custom_objective=False,
+):
     """
     Solves the IK problem for one target point with a specified learning rate.
 
@@ -135,13 +146,18 @@ def solve_single_ik(target, init_rot, lower_bounds, upper_bounds,
        step: The number of iterations taken.
     """
     target = jnp.array(target, dtype=jnp.float32)
-    print("using init_rot",init_rot)
+    print("using init_rot", init_rot)
     init_rot = jnp.array(init_rot, dtype=jnp.float32).flatten()
 
     ik_problem = CustomIKProblem(
-        fksolver, target, lower_bounds, upper_bounds,
-        penalty_weight=0.25, configuration="hand_down", hand=hand,
-        known_rotations=known_rotations
+        fksolver,
+        target,
+        lower_bounds,
+        upper_bounds,
+        penalty_weight=0.25,
+        configuration="hand_down",
+        hand=hand,
+        known_rotations=known_rotations,
     )
 
     def body_fn(state):
@@ -163,10 +179,28 @@ def solve_single_ik(target, init_rot, lower_bounds, upper_bounds,
     return best_angles, best_obj, step
 
 
-@partial(jax.jit, static_argnames=("fk_solver", "controlled_indices", "max_iterations", "use_custom_objective"))
-def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
-                        fk_solver, controlled_indices, controlled_map_array,
-                        effector_index, max_iterations, epsilon, use_custom_objective=False):
+@partial(
+    jax.jit,
+    static_argnames=(
+        "fk_solver",
+        "controlled_indices",
+        "max_iterations",
+        "use_custom_objective",
+    ),
+)
+def solve_single_ik_ccd(
+    target,
+    init_angles,
+    lower_bounds,
+    upper_bounds,
+    fk_solver,
+    controlled_indices,
+    controlled_map_array,
+    effector_index,
+    max_iterations,
+    epsilon,
+    use_custom_objective=False,
+):
     """
     CCD solver that iteratively “sweeps” through the chain from the end effector back to the base.
 
@@ -195,9 +229,14 @@ def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
     # When using a custom objective, create a CustomIKProblem instance.
     if use_custom_objective:
         ik_problem = CustomIKProblem(
-            fk_solver, target, lower_bounds, upper_bounds,
-            penalty_weight=0.25, configuration="hand_down", hand="left",  # note: `hand` must be defined in your context
-            known_rotations=None
+            fk_solver,
+            target,
+            lower_bounds,
+            upper_bounds,
+            penalty_weight=0.25,
+            configuration="hand_down",
+            hand="left",  # note: `hand` must be defined in your context
+            known_rotations=None,
         )
 
         def ccd_cond(state):
@@ -205,6 +244,7 @@ def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
             obj = ik_problem._objective_jax_pure(angles)
             return jnp.logical_and(obj > epsilon, it < max_iterations)
     else:
+
         def ccd_cond(state):
             it, angles = state
             fk = fk_solver.compute_fk_from_angles(angles)
@@ -239,9 +279,7 @@ def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
             R_delta = rotation_matrix_from_axis_angle(axis_normalized, angle_delta)
             parent_idx = fk_solver.parent_indices[bone_idx]
             parent_transform = jax.lax.select(
-                parent_idx < 0,
-                jnp.eye(4, dtype=jnp.float32),
-                fk[parent_idx]
+                parent_idx < 0, jnp.eye(4, dtype=jnp.float32), fk[parent_idx]
             )
             parent_rot = parent_transform[:3, :3]
             angle_start = controlled_map_array[bone_idx]
@@ -254,16 +292,20 @@ def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
             lb = jax.lax.dynamic_slice(lower_bounds, (angle_start,), (3,))
             ub = jax.lax.dynamic_slice(upper_bounds, (angle_start,), (3,))
             new_angles_local = jnp.clip(new_angles_local, lb, ub)
-            candidate_angles = jax.lax.dynamic_update_slice(angles_in, new_angles_local, (angle_start,))
+            candidate_angles = jax.lax.dynamic_update_slice(
+                angles_in, new_angles_local, (angle_start,)
+            )
             candidate_angles = jnp.clip(candidate_angles, lower_bounds, upper_bounds)
             # If using the custom objective, accept the update only if it lowers the objective.
             if use_custom_objective:
                 current_obj = ik_problem._objective_jax_pure(angles_in)
                 candidate_obj = ik_problem._objective_jax_pure(candidate_angles)
-                new_angles_final = jax.lax.cond(candidate_obj < current_obj,
-                                                lambda _: candidate_angles,
-                                                lambda _: angles_in,
-                                                operand=None)
+                new_angles_final = jax.lax.cond(
+                    candidate_obj < current_obj,
+                    lambda _: candidate_angles,
+                    lambda _: angles_in,
+                    operand=None,
+                )
                 return new_angles_final
             else:
                 return candidate_angles
@@ -283,10 +325,28 @@ def solve_single_ik_ccd(target, init_angles, lower_bounds, upper_bounds,
     return final_angles, final_obj, it_final
 
 
-@partial(jax.jit, static_argnames=("fk_solver", "controlled_indices", "max_iterations", "use_custom_objective"))
-def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
-                           fk_solver, controlled_indices, controlled_map_array,
-                           effector_index, max_iterations, epsilon, use_custom_objective=False):
+@partial(
+    jax.jit,
+    static_argnames=(
+        "fk_solver",
+        "controlled_indices",
+        "max_iterations",
+        "use_custom_objective",
+    ),
+)
+def solve_single_ik_fabrik(
+    target,
+    init_angles,
+    lower_bounds,
+    upper_bounds,
+    fk_solver,
+    controlled_indices,
+    controlled_map_array,
+    effector_index,
+    max_iterations,
+    epsilon,
+    use_custom_objective=False,
+):
     """
     FABRIK solver that works on the joint positions of the IK chain.
 
@@ -319,21 +379,29 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
         return fk_init[idx][:3, 3]
 
     joints_init = jnp.stack(
-        [get_joint(bone_idx) for bone_idx in controlled_indices] +
-        [fk_init[effector_index][:3, 3]],
-        axis=0)
+        [get_joint(bone_idx) for bone_idx in controlled_indices]
+        + [fk_init[effector_index][:3, 3]],
+        axis=0,
+    )
     bone_lengths_const = jnp.linalg.norm(joints_init[1:] - joints_init[:-1], axis=1)
     root_const = joints_init[0]
     total_length = jnp.sum(bone_lengths_const)
     # Precompute the default (rest) directions for each bone.
     default_dirs = joints_init[1:] - joints_init[:-1]
-    default_dirs = default_dirs / (jnp.linalg.norm(default_dirs, axis=1, keepdims=True) + 1e-6)
+    default_dirs = default_dirs / (
+        jnp.linalg.norm(default_dirs, axis=1, keepdims=True) + 1e-6
+    )
 
     if use_custom_objective:
         ik_problem = CustomIKProblem(
-            fk_solver, target, lower_bounds, upper_bounds,
-            penalty_weight=0.25, configuration="hand_down", hand="left",
-            known_rotations=None
+            fk_solver,
+            target,
+            lower_bounds,
+            upper_bounds,
+            penalty_weight=0.25,
+            configuration="hand_down",
+            hand="left",
+            known_rotations=None,
         )
 
         def fabrik_cond(state):
@@ -341,6 +409,7 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
             obj = ik_problem._objective_jax_pure(angles)
             return jnp.logical_and(obj > epsilon, it < max_iterations)
     else:
+
         def fabrik_cond(state):
             it, angles = state
             fk = fk_solver.compute_fk_from_angles(angles)
@@ -367,15 +436,21 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
 
             return jax.lax.fori_loop(0, n_joints - 1, body_unreachable, joints)
 
-        joints = jax.lax.cond(target_dist > total_length, unreachable, lambda x: x, joints)
+        joints = jax.lax.cond(
+            target_dist > total_length, unreachable, lambda x: x, joints
+        )
 
         # Backward pass: set effector to target and update backward.
         joints = joints.at[-1].set(target)
 
         def backward_body(i, joints_in):
             j = n_joints - 2 - i
-            dir_vec = (joints_in[j] - joints_in[j + 1]) / (jnp.linalg.norm(joints_in[j] - joints_in[j + 1]) + 1e-6)
-            return joints_in.at[j].set(joints_in[j + 1] + dir_vec * bone_lengths_const[j])
+            dir_vec = (joints_in[j] - joints_in[j + 1]) / (
+                jnp.linalg.norm(joints_in[j] - joints_in[j + 1]) + 1e-6
+            )
+            return joints_in.at[j].set(
+                joints_in[j + 1] + dir_vec * bone_lengths_const[j]
+            )
 
         joints = jax.lax.fori_loop(0, n_joints - 1, backward_body, joints)
 
@@ -384,8 +459,12 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
 
         def forward_body(i, joints_in):
             j = i
-            dir_vec = (joints_in[j + 1] - joints_in[j]) / (jnp.linalg.norm(joints_in[j + 1] - joints_in[j]) + 1e-6)
-            return joints_in.at[j + 1].set(joints_in[j] + dir_vec * bone_lengths_const[j])
+            dir_vec = (joints_in[j + 1] - joints_in[j]) / (
+                jnp.linalg.norm(joints_in[j + 1] - joints_in[j]) + 1e-6
+            )
+            return joints_in.at[j + 1].set(
+                joints_in[j] + dir_vec * bone_lengths_const[j]
+            )
 
         joints = jax.lax.fori_loop(0, n_joints - 1, forward_body, joints)
 
@@ -403,9 +482,7 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
             R_global = rotation_matrix_from_axis_angle(axis_normalized, angle_needed)
             parent_idx = fk_solver.parent_indices[bone_idx]
             parent_transform = jax.lax.select(
-                parent_idx < 0,
-                jnp.eye(4, dtype=jnp.float32),
-                fk[parent_idx]
+                parent_idx < 0, jnp.eye(4, dtype=jnp.float32), fk[parent_idx]
             )
             parent_rot = parent_transform[:3, :3]
             new_R_local = parent_rot.T @ R_global[:3, :3]
@@ -415,15 +492,19 @@ def solve_single_ik_fabrik(target, init_angles, lower_bounds, upper_bounds,
             lb = jax.lax.dynamic_slice(lower_bounds, (angle_start,), (3,))
             ub = jax.lax.dynamic_slice(upper_bounds, (angle_start,), (3,))
             new_angles_local = jnp.clip(new_angles_local, lb, ub)
-            candidate_angles = jax.lax.dynamic_update_slice(angles_in, new_angles_local, (angle_start,))
+            candidate_angles = jax.lax.dynamic_update_slice(
+                angles_in, new_angles_local, (angle_start,)
+            )
             candidate_angles = jnp.clip(candidate_angles, lower_bounds, upper_bounds)
             if use_custom_objective:
                 current_obj = ik_problem._objective_jax_pure(angles_in)
                 candidate_obj = ik_problem._objective_jax_pure(candidate_angles)
-                new_angles_final = jax.lax.cond(candidate_obj < current_obj,
-                                                lambda _: candidate_angles,
-                                                lambda _: angles_in,
-                                                operand=None)
+                new_angles_final = jax.lax.cond(
+                    candidate_obj < current_obj,
+                    lambda _: candidate_angles,
+                    lambda _: angles_in,
+                    operand=None,
+                )
                 return new_angles_final
             else:
                 return candidate_angles
@@ -453,18 +534,19 @@ class FKSolver:
         self.hand = hand
         # Use custom controlled bones if provided; otherwise, use defaults.
         if controlled_bones is None:
-            controlled_bones = [f"{hand}_collar",
-                                f"{hand}_shoulder",
-                                f"{hand}_elbow",
-                                f"{hand}_wrist"]
+            controlled_bones = [
+                f"{hand}_collar",
+                f"{hand}_shoulder",
+                f"{hand}_elbow",
+                f"{hand}_wrist",
+            ]
         self.controlled_bones = controlled_bones
         # Save controlled indices as a tuple (so they can be static in JIT).
         self.controlled_indices = tuple(
             i for i, name in enumerate(self.bone_names) if name in self.controlled_bones
         )
         self.default_rotations = jnp.stack(
-            [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names],
-            axis=0
+            [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
         )
         # Create a mapping array: for each bone index, store the start index in the angle vector if controlled, else -1.
         controlled_map = -np.ones(len(self.bone_names), dtype=np.int32)
@@ -475,7 +557,9 @@ class FKSolver:
         try:
             self.effector_index = self.bone_names.index(f"{hand}_index3_look")
         except ValueError:
-            raise ValueError(f"Effector bone '{hand}_index3_look' not found in skeleton.")
+            raise ValueError(
+                f"Effector bone '{hand}_index3_look' not found in skeleton."
+            )
 
     def _prepare_fk_arrays(self):
         self.bone_names = []
@@ -486,12 +570,16 @@ class FKSolver:
             current_index = len(self.bone_names)
             self.bone_names.append(bone_name)
             bone = self.skeleton[bone_name]
-            self.local_list.append(jnp.array(bone["local_transform"], dtype=jnp.float32))
+            self.local_list.append(
+                jnp.array(bone["local_transform"], dtype=jnp.float32)
+            )
             self.parent_list.append(parent_index)
             for child in bone["children"]:
                 dfs(child, current_index)
 
-        roots = [bone["name"] for bone in self.skeleton.values() if bone["parent"] is None]
+        roots = [
+            bone["name"] for bone in self.skeleton.values() if bone["parent"] is None
+        ]
         for root in roots:
             dfs(root, -1)
         self.local_array = jnp.stack(self.local_list, axis=0)
@@ -506,7 +594,7 @@ class FKSolver:
             self.parent_indices,
             self.default_rotations,
             self.controlled_indices,
-            angle_vector
+            angle_vector,
         )
 
     def get_bone_head_tail_from_fk(self, fk_transforms, bone_name):
@@ -542,7 +630,9 @@ class FKSolver:
             actors.append(Line(head_np, tail_np, lw=3, c="blue"))
             actors.append(Sphere(pos=head_np, r=0.02, c="red"))
         for target, color in target_pos:
-            actors.append(Sphere(pos=target, r=0.02 if color == "green" else 0.01, c=color))
+            actors.append(
+                Sphere(pos=target, r=0.02 if color == "green" else 0.01, c=color)
+            )
         show(actors, "Skeleton FK", axes=1, interactive=interactive)
 
 
@@ -551,9 +641,17 @@ class CustomIKProblem:
     Defines the inverse kinematics objective.
     """
 
-    def __init__(self, fksolver, target_pos, lower_bounds, upper_bounds,
-                 penalty_weight=1.0, known_rotations=(), hand="left",
-                 configuration="pointing"):
+    def __init__(
+        self,
+        fksolver,
+        target_pos,
+        lower_bounds,
+        upper_bounds,
+        penalty_weight=1.0,
+        known_rotations=(),
+        hand="left",
+        configuration="pointing",
+    ):
         self.fksolver = fksolver  # An instance of FKSolver.
         self.lower_bounds = jnp.array(lower_bounds, dtype=jnp.float32)
         self.upper_bounds = jnp.array(upper_bounds, dtype=jnp.float32)
@@ -572,25 +670,37 @@ class CustomIKProblem:
 
         # Get the fingertip position.
         head_index, tail_index = self.fksolver.get_bone_head_tail_from_fk(
-            fk_transforms, f"{self.hand}_index3_look")
+            fk_transforms, f"{self.hand}_index3_look"
+        )
         fingertip = head_index
         distance = jnp.linalg.norm(fingertip - self.target_pos)
 
         # Get additional look–at targets.
         head_wrist, tail_wrist = self.fksolver.get_bone_head_tail_from_fk(
-            fk_transforms, f"{self.hand}_wrist")
+            fk_transforms, f"{self.hand}_wrist"
+        )
         head_shoulder, tail_shoulder = self.fksolver.get_bone_head_tail_from_fk(
-            fk_transforms, f"{self.hand}_shoulder")
+            fk_transforms, f"{self.hand}_shoulder"
+        )
         target_wrist_look = tail_wrist
         target_index3_look = tail_index
         target_shoulder_look = tail_shoulder
-        target_shoulder_look = target_shoulder_look.at[2].set(target_shoulder_look[2] - 1.0)
+        target_shoulder_look = target_shoulder_look.at[2].set(
+            target_shoulder_look[2] - 1.0
+        )
         target_wrist_look = target_wrist_look.at[1].set(target_wrist_look[1] + 1.0)
         target_index3_look = target_index3_look.at[2].set(target_index3_look[2] + 1.0)
 
-        wrist_penalty = jitted_look_at_penalty(head_wrist, tail_wrist, target_wrist_look)
-        index_penalty = jitted_look_at_penalty(head_index, tail_index, target_index3_look)
-        shoulder_penalty = jitted_look_at_penalty(head_shoulder, tail_shoulder, target_shoulder_look) * 0.002
+        wrist_penalty = jitted_look_at_penalty(
+            head_wrist, tail_wrist, target_wrist_look
+        )
+        index_penalty = jitted_look_at_penalty(
+            head_index, tail_index, target_index3_look
+        )
+        shoulder_penalty = (
+            jitted_look_at_penalty(head_shoulder, tail_shoulder, target_shoulder_look)
+            * 0.002
+        )
 
         if isinstance(self.known_rotations, tuple) and len(self.known_rotations) == 2:
             candidate_known, mask = self.known_rotations
@@ -598,15 +708,21 @@ class CustomIKProblem:
             diff_sq = diff_sq * mask.astype(jnp.float32)
             valid_count = jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
             difference_penalty = (jnp.sum(diff_sq) / valid_count) / 20.0
-        elif isinstance(self.known_rotations, (list, tuple)) and len(self.known_rotations) > 0:
-            diff_penalties = [jnp.sum((angle_vector - init) ** 2)
-                              for init in self.known_rotations]
+        elif (
+            isinstance(self.known_rotations, (list, tuple))
+            and len(self.known_rotations) > 0
+        ):
+            diff_penalties = [
+                jnp.sum((angle_vector - init) ** 2) for init in self.known_rotations
+            ]
             difference_penalty = jnp.mean(jnp.array(diff_penalties)) / 20.0
         else:
             difference_penalty = 0.0
 
         total_penalty = (wrist_penalty + index_penalty + shoulder_penalty) / 3.0
-        total_objective = distance + (total_penalty + difference_penalty) * self.penalty_weight
+        total_objective = (
+            distance + (total_penalty + difference_penalty) * self.penalty_weight
+        )
         return total_objective
 
 
@@ -615,8 +731,17 @@ class InverseKinematicsSolver:
     Library-style Inverse Kinematics (IK) solver.
     """
 
-    def __init__(self, gltf_file, hand="left", controlled_bones=None, bounds=None,
-                 penalty_weight=0.25, threshold=0.01, num_steps=1000, optimize_jax_cache=True):
+    def __init__(
+        self,
+        gltf_file,
+        hand="left",
+        controlled_bones=None,
+        bounds=None,
+        penalty_weight=0.25,
+        threshold=0.01,
+        num_steps=1000,
+        optimize_jax_cache=True,
+    ):
         """
         Parameters:
             gltf_file (str): Path to the GLTF file.
@@ -636,24 +761,43 @@ class InverseKinematicsSolver:
             jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
             jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-            jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
-            jax.config.update('jax_default_device', jax.devices('cpu')[0])
+            jax.config.update(
+                "jax_persistent_cache_enable_xla_caches",
+                "xla_gpu_per_fusion_autotune_cache_dir",
+            )
+            jax.config.update("jax_default_device", jax.devices("cpu")[0])
 
         # Set default bounds if not provided.
         if bounds is None:
             if hand == "left":
                 bounds = [
-                    (-10, 10), (-10, 10), (-10, 10),
-                    (0, 50), (-140, 50), (-70, 25),
-                    (-45, 90), (-180, 5), (-10, 10),
-                    (-90, 90), (-70, 70), (-55, 85)
+                    (-10, 10),
+                    (-10, 10),
+                    (-10, 10),
+                    (0, 50),
+                    (-140, 50),
+                    (-70, 25),
+                    (-45, 90),
+                    (-180, 5),
+                    (-10, 10),
+                    (-90, 90),
+                    (-70, 70),
+                    (-55, 85),
                 ]
             else:
                 bounds = [
-                    (-10, 10), (-10, 10), (-10, 10),
-                    (-50, 0), (-50, 140), (-25, 70),
-                    (-90, 45), (-5, 180), (-10, 10),
-                    (-90, 90), (-70, 70), (-55, 85)
+                    (-10, 10),
+                    (-10, 10),
+                    (-10, 10),
+                    (-50, 0),
+                    (-50, 140),
+                    (-25, 70),
+                    (-90, 45),
+                    (-5, 180),
+                    (-10, 10),
+                    (-90, 90),
+                    (-70, 70),
+                    (-55, 85),
                 ]
         # Convert bounds from degrees to radians.
         bounds_radians = [(np.radians(l), np.radians(h)) for l, h in bounds]
@@ -668,8 +812,17 @@ class InverseKinematicsSolver:
         # Maintain an average iteration time (in seconds) to help set a maximum time budget.
         self.avg_iter_time = None  # initial guess (adjust as needed)
 
-    def solve(self, target_point, initial_rotations=None, known_rotations=(),
-              learning_rate=0.2, max_time=None, verbose=False,max_iterations=None,use_custom_objective=False):
+    def solve(
+        self,
+        target_point,
+        initial_rotations=None,
+        known_rotations=(),
+        learning_rate=0.2,
+        max_time=None,
+        verbose=False,
+        max_iterations=None,
+        use_custom_objective=False,
+    ):
         """
         Solve the inverse kinematics problem for a given target point.
 
@@ -706,8 +859,9 @@ class InverseKinematicsSolver:
             allowed_steps = max_iterations
 
         if verbose and max_time is not None:
-            print(f"User set max time. Based on previous step times we dynamically set the allowed steps to: {allowed_steps}")
-
+            print(
+                f"User set max time. Based on previous step times we dynamically set the allowed steps to: {allowed_steps}"
+            )
 
         start_time = time.time()
         best_angles, best_obj, steps = solve_single_ik(
@@ -721,22 +875,37 @@ class InverseKinematicsSolver:
             threshold=self.threshold,
             num_steps=allowed_steps,
             learning_rate=learning_rate,
-            use_custom_objective=use_custom_objective
+            use_custom_objective=use_custom_objective,
         )
         elapsed_time = time.time() - start_time
         if steps > 0:
             new_iter_time = elapsed_time / steps
-            self.avg_iter_time = new_iter_time if self.avg_iter_time is None else 0.9 * self.avg_iter_time + 0.1 * new_iter_time
+            self.avg_iter_time = (
+                new_iter_time
+                if self.avg_iter_time is None
+                else 0.9 * self.avg_iter_time + 0.1 * new_iter_time
+            )
 
         if max_time is not None and elapsed_time > max_time and verbose:
-            print(f"Time limit exceeded: {elapsed_time:.4f} seconds (allowed {max_time} seconds)")
+            print(
+                f"Time limit exceeded: {elapsed_time:.4f} seconds (allowed {max_time} seconds)"
+            )
 
         if best_obj > self.threshold and verbose:
-            print(f"Warning: Optimization did not converge below threshold ({self.threshold}).")
+            print(
+                f"Warning: Optimization did not converge below threshold ({self.threshold})."
+            )
 
         return np.array(best_angles), float(best_obj), int(steps)
 
-    def solveCCD(self, target_point, initial_rotations=None, max_iterations=100, epsilon=0.005,use_custom_objective=False):
+    def solveCCD(
+        self,
+        target_point,
+        initial_rotations=None,
+        max_iterations=100,
+        epsilon=0.005,
+        use_custom_objective=False,
+    ):
         """
         Solve the IK problem using the CCD algorithm.
         """
@@ -756,11 +925,18 @@ class InverseKinematicsSolver:
             effector_index=self.fk_solver.effector_index,
             max_iterations=max_iterations,
             epsilon=epsilon,
-            use_custom_objective=use_custom_objective
+            use_custom_objective=use_custom_objective,
         )
         return np.array(angles), float(err), int(iters)
 
-    def solveFABRIK(self, target_point, initial_rotations=None, max_iterations=100, epsilon=0.005,use_custom_objective=False):
+    def solveFABRIK(
+        self,
+        target_point,
+        initial_rotations=None,
+        max_iterations=100,
+        epsilon=0.005,
+        use_custom_objective=False,
+    ):
         """
         Solve the IK problem using the FABRIK algorithm.
         """
@@ -781,7 +957,7 @@ class InverseKinematicsSolver:
             effector_index=self.fk_solver.effector_index,
             max_iterations=max_iterations,
             epsilon=epsilon,
-            use_custom_objective=use_custom_objective
+            use_custom_objective=use_custom_objective,
         )
         return np.array(angles), float(err), int(iters)
 
@@ -789,27 +965,69 @@ class InverseKinematicsSolver:
         """
         Render the skeleton with the given pose.
         """
-        self.fk_solver.render(angle_vector=angle_vector, target_pos=target_pos, interactive=interactive)
-
+        self.fk_solver.render(
+            angle_vector=angle_vector, target_pos=target_pos, interactive=interactive
+        )
 
 
 def main():
     parser = configargparse.ArgumentParser(
         description="Inverse Kinematics Solver Configuration",
-        default_config_files=["config.ini"]
+        default_config_files=["config.ini"],
     )
-    parser.add("--gltf_file", type=str, default="../smplx.glb", help="Path to the glTF file.")
-    parser.add("--hand", type=str, choices=["left", "right"], default="left", help="Which hand to use.")
-    parser.add("--bounds", type=str, default=None, help="List of bounds as a JSON string.")
-    parser.add("--controlled_bones", type=str, default=None, help="Comma-separated list of controlled bones.")
-    parser.add("--threshold", type=float, default=0.005, help="Threshold value for the solver.")
-    parser.add("--num_steps", type=int, default=500, help="Number of steps for the solver.")
-    parser.add("--target_points", type=str, default=None, help="List of target points as a JSON string.")
-    parser.add("--learning_rate", type=float, default=0.1, help="Learning rate for the solver.")
-    parser.add("--max_iterations", type=int, default=500, help="Maximum iterations for each solver call.")
-    parser.add("--solver_type", type=str, choices=["gd", "ccd", "fabrik"], default="gd",
-               help="Select the solver: gd (Gradient Descent), ccd, or fabrik.")
-    parser.add("--custom_objective", type=bool, default=False, help="Use the custom objective for the solver.")
+    parser.add(
+        "--gltf_file", type=str, default="../smplx.glb", help="Path to the glTF file."
+    )
+    parser.add(
+        "--hand",
+        type=str,
+        choices=["left", "right"],
+        default="left",
+        help="Which hand to use.",
+    )
+    parser.add(
+        "--bounds", type=str, default=None, help="List of bounds as a JSON string."
+    )
+    parser.add(
+        "--controlled_bones",
+        type=str,
+        default=None,
+        help="Comma-separated list of controlled bones.",
+    )
+    parser.add(
+        "--threshold", type=float, default=0.005, help="Threshold value for the solver."
+    )
+    parser.add(
+        "--num_steps", type=int, default=500, help="Number of steps for the solver."
+    )
+    parser.add(
+        "--target_points",
+        type=str,
+        default=None,
+        help="List of target points as a JSON string.",
+    )
+    parser.add(
+        "--learning_rate", type=float, default=0.1, help="Learning rate for the solver."
+    )
+    parser.add(
+        "--max_iterations",
+        type=int,
+        default=500,
+        help="Maximum iterations for each solver call.",
+    )
+    parser.add(
+        "--solver_type",
+        type=str,
+        choices=["gd", "ccd", "fabrik"],
+        default="gd",
+        help="Select the solver: gd (Gradient Descent), ccd, or fabrik.",
+    )
+    parser.add(
+        "--custom_objective",
+        type=bool,
+        default=False,
+        help="Use the custom objective for the solver.",
+    )
 
     args = parser.parse_args()
 
@@ -817,16 +1035,23 @@ def main():
     hand = args.hand
 
     bounds = json.loads(args.bounds) if args.bounds else None
-    controlled_bones = args.controlled_bones.split(",") if args.controlled_bones else None
+    controlled_bones = (
+        args.controlled_bones.split(",") if args.controlled_bones else None
+    )
 
-    target_list = json.loads(args.target_points) if args.target_points else [[0.15, 0, 0.35]]
+    target_list = (
+        json.loads(args.target_points) if args.target_points else [[0.15, 0, 0.35]]
+    )
     target = [np.array(pt) for pt in target_list]
 
     solver = InverseKinematicsSolver(
-        gltf_file, controlled_bones=controlled_bones, bounds=bounds, threshold=args.threshold, num_steps=args.num_steps,
-        hand=hand
+        gltf_file,
+        controlled_bones=controlled_bones,
+        bounds=bounds,
+        threshold=args.threshold,
+        num_steps=args.num_steps,
+        hand=hand,
     )
-
 
     tbar = tqdm(range(len(target)))
     avg_steps = 0
@@ -839,21 +1064,30 @@ def main():
         time_iter = time.time()
         if args.solver_type == "gd":
             best_angles, obj, steps = solver.solve(
-                target_point=target[i], learning_rate=args.learning_rate, max_iterations=args.max_iterations,use_custom_objective=args.custom_objective
+                target_point=target[i],
+                learning_rate=args.learning_rate,
+                max_iterations=args.max_iterations,
+                use_custom_objective=args.custom_objective,
             )
         elif args.solver_type == "ccd":
             best_angles, obj, steps = solver.solveCCD(
-                target_point=target[i], max_iterations=args.max_iterations,use_custom_objective=args.custom_objective
+                target_point=target[i],
+                max_iterations=args.max_iterations,
+                use_custom_objective=args.custom_objective,
             )
         elif args.solver_type == "fabrik":
             best_angles, obj, steps = solver.solveFABRIK(
-                target_point=target[i], max_iterations=args.max_iterations,use_custom_objective=args.custom_objective
+                target_point=target[i],
+                max_iterations=args.max_iterations,
+                use_custom_objective=args.custom_objective,
             )
         if obj < args.threshold:
             solved_success += 1
 
         if i > 10:
-            print(f"Time for iteration {i}: {time.time() - time_iter:.4f} seconds. Steps: {steps}. Success: {obj < args.threshold}")
+            print(
+                f"Time for iteration {i}: {time.time() - time_iter:.4f} seconds. Steps: {steps}. Success: {obj < args.threshold}"
+            )
 
         if i == 10:
             time1 = time.time()
@@ -864,7 +1098,9 @@ def main():
     solved_success_rate = solved_success / len(target)
 
     print(f"Result: error = {obj}, iterations = {steps}, average = {avg_steps}")
-    print(f"Solving {len(target)} times with total {avg_steps} iterations took {time.time() - time1:.4f} seconds")
+    print(
+        f"Solving {len(target)} times with total {avg_steps} iterations took {time.time() - time1:.4f} seconds"
+    )
     print(f"Success rate: {solved_success_rate:.4f}")
 
 

@@ -70,7 +70,7 @@ class HandSpecification:
         arm_45_down: bool = False,
         arm_flat: bool = False,
         special_obj=None,
-        penalize_self_collision: bool = False
+        penalize_self_collision: bool = False,
     ):
         """
         Initialize the hand specification with various pose and direction flags.
@@ -118,7 +118,7 @@ class HandSpecification:
         controlled_bones: list = None,
         full_trajectory: bool = False,
         last_position: bool = True,
-        weight: float = 1.0
+        weight: float = 1.0,
     ) -> list:
         """
         Build a list of IK objectives for the specified hand/arm configuration.

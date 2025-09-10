@@ -27,13 +27,15 @@ from jax_ik.objectives import (
     SDFSelfCollisionPenaltyObj,
 )
 
-#make cache temp folder
+# make cache temp folder
 os.makedirs("./jax_cache", exist_ok=True)
 
 jax.config.update("jax_compilation_cache_dir", "./jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+jax.config.update(
+    "jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir"
+)
 jax.config.update("jax_platforms", "cpu")
 
 
@@ -271,9 +273,13 @@ def solve_ik(
         _OPTIONAL_POOL = [_ZeroObjective() for _ in range(MAX_OPTIONAL)]
 
     if len(mandatory_obj_fns) > MAX_MANDATORY:
-        raise ValueError(f"Maximum {MAX_MANDATORY} mandatory objectives supported, got {len(mandatory_obj_fns)}")
+        raise ValueError(
+            f"Maximum {MAX_MANDATORY} mandatory objectives supported, got {len(mandatory_obj_fns)}"
+        )
     if len(optional_obj_fns) > MAX_OPTIONAL:
-        raise ValueError(f"Maximum {MAX_OPTIONAL} optional objectives supported, got {len(optional_obj_fns)}")
+        raise ValueError(
+            f"Maximum {MAX_OPTIONAL} optional objectives supported, got {len(optional_obj_fns)}"
+        )
 
     def _populate(pool, caller_fns):
         """
@@ -394,7 +400,6 @@ def _solve_ik_core(
     lower_b = jnp.tile(lower_bounds[None, :], (free_T, 1))
     upper_b = jnp.tile(upper_bounds[None, :], (free_T, 1))
 
-
     def compute_objectives(x_full):
         mand = jnp.float32(0.0)
         for fn in mandatory_obj_fns:
@@ -409,13 +414,11 @@ def _solve_ik_core(
         total = jnp.nan_to_num(total, nan=1e6, posinf=1e6, neginf=1e6)
         return total, mand, opt
 
-
     def obj_free(x_free):
         x_full = X_full.at[free_indices].set(x_free)
         return compute_objectives(x_full)
 
     value_and_grad = jax.value_and_grad(lambda x: obj_free(x)[0])
-
 
     def gd_step(state):
         i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
@@ -432,12 +435,12 @@ def _solve_ik_core(
         mask = (m * grad > 0).astype(grad.dtype)
         # Normalize mask by its mean, clamped to avoid division by very small numbers
         mask = mask / jnp.maximum(mask.mean(), 1e-3)
-        
+
         # Apply cautious mask to the normalized gradient
         denom = jnp.sqrt(v_hat) + epsilon
         norm_grad = (m_hat * mask) / denom
         step = learning_rate * norm_grad
-        
+
         x_new = jnp.clip(x - step, lower_b, upper_b)
 
         new_total, new_mand, new_opt = obj_free(x_new)
@@ -492,7 +495,6 @@ def _solve_ik_core(
         _,
     ) = jax.lax.while_loop(gd_cond, gd_step, init_state)
 
-
     final_traj = X_full.at[free_indices].set(best_free)
     return iterations, final_traj, best_total, jnp.int32(0)
 
@@ -503,7 +505,12 @@ class FKSolver:
     Loads skeleton, mesh, and computes SDF if requested.
     """
 
-    def __init__(self, model_file: str, controlled_bones: list = None, do_compute_sdf: bool = True):
+    def __init__(
+        self,
+        model_file: str,
+        controlled_bones: list = None,
+        do_compute_sdf: bool = True,
+    ):
         """
         Initialize the FKSolver.
 
@@ -527,8 +534,12 @@ class FKSolver:
 
         self._prepare_fk_arrays()
         self.controlled_bones = controlled_bones if controlled_bones is not None else []
-        self.controlled_indices = [i for i, name in enumerate(self.bone_names) if name in self.controlled_bones]
-        self.default_rotations = jnp.stack([jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0)
+        self.controlled_indices = [
+            i for i, name in enumerate(self.bone_names) if name in self.controlled_bones
+        ]
+        self.default_rotations = jnp.stack(
+            [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
+        )
         controlled_map = -np.ones(len(self.bone_names), dtype=np.int32)
         for j, bone_idx in enumerate(self.controlled_indices):
             controlled_map[bone_idx] = 3 * j
@@ -543,18 +554,21 @@ class FKSolver:
                 self.mesh_data = load_mesh_data_from_urdf(self.model_file, self)
             else:
                 self.mesh_data = load_mesh_data_from_gltf(self.model_file, self)
-    
+
             if self.mesh_data:
                 import trimesh
+
                 print("Computing SDF from mesh...")
                 rest_mesh = trimesh.Trimesh(
                     vertices=np.asarray(self.mesh_data["vertices"][:, :3]),
-                    faces=np.asarray(self.mesh_data["faces"])
+                    faces=np.asarray(self.mesh_data["faces"]),
                 )
                 self.sdf = compute_sdf(rest_mesh)
                 print("SDF computation complete.")
             else:
-                print("Warning: Could not load mesh data. Self-collision will be disabled.")
+                print(
+                    "Warning: Could not load mesh data. Self-collision will be disabled."
+                )
 
     def _prepare_fk_arrays(self) -> None:
         """
@@ -576,7 +590,9 @@ class FKSolver:
             self.bone_names.append(bone_name)
 
             bone = self.skeleton[bone_name]
-            self.local_list.append(jnp.asarray(bone["local_transform"], dtype=jnp.float32))
+            self.local_list.append(
+                jnp.asarray(bone["local_transform"], dtype=jnp.float32)
+            )
             self.parent_list.append(parent_index)
 
             # Process children in consistent order
@@ -596,7 +612,9 @@ class FKSolver:
         self.parent_indices = jnp.asarray(self.parent_list, dtype=jnp.int32)
 
         print(f"Loaded skeleton with {len(self.bone_names)} bones")
-        print(f"Root bones: {[name for name, bone in self.skeleton.items() if bone['parent'] is None]}")
+        print(
+            f"Root bones: {[name for name, bone in self.skeleton.items() if bone['parent'] is None]}"
+        )
 
         # Debug: Print some bone transforms
         # print("Sample bone local transforms:")
@@ -629,7 +647,9 @@ class FKSolver:
         )
         return result
 
-    def get_bone_head_tail_from_fk(self, fk_transforms: jnp.ndarray, bone_name: str) -> tuple:
+    def get_bone_head_tail_from_fk(
+        self, fk_transforms: jnp.ndarray, bone_name: str
+    ) -> tuple:
         """
         Get the world-space head and tail positions of a bone.
 
@@ -649,7 +669,9 @@ class FKSolver:
         head = global_transform[:3, 3]
 
         bone = self.skeleton[bone_name]
-        tail_local = jnp.asarray([0.0, bone["bone_length"], 0.0, 1.0], dtype=jnp.float32)
+        tail_local = jnp.asarray(
+            [0.0, bone["bone_length"], 0.0, 1.0], dtype=jnp.float32
+        )
         tail = global_transform @ tail_local
         return head, tail[:3]
 
@@ -675,12 +697,14 @@ class FKSolver:
         """
         # Prepare angles
         if angle_vector is None:
-            angle_vector = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
+            angle_vector = jnp.zeros(
+                len(self.controlled_indices) * 3, dtype=jnp.float32
+            )
         else:
             angle_vector = jnp.asarray(angle_vector, dtype=jnp.float32)
 
         # FK transforms
-        #fk_transforms = self.compute_fk_from_angles(angle_vector)
+        # fk_transforms = self.compute_fk_from_angles(angle_vector)
 
         # Load mesh data if not provided
         if mesh_data is None:
@@ -706,7 +730,9 @@ class FKSolver:
             pv_mesh.points = vertices
 
         plotter = pv.Plotter()
-        plotter.add_mesh(pv_mesh, color="lightblue", show_edges=False, smooth_shading=True)
+        plotter.add_mesh(
+            pv_mesh, color="lightblue", show_edges=False, smooth_shading=True
+        )
 
         camera_position = [
             0.0,
@@ -726,16 +752,19 @@ class FKSolver:
 
         # Draw target positions
         for pt in target_pos:
-            plotter.add_mesh(pv.Sphere(radius=0.02, center=np.asarray(pt)), color="green")
+            plotter.add_mesh(
+                pv.Sphere(radius=0.02, center=np.asarray(pt)), color="green"
+            )
 
         # Draw collider spheres
         for sphere in collider_spheres:
             center = np.asarray(sphere.get("center", [0, 0, 0]))
             radius = float(sphere.get("radius", 0.05))
-            plotter.add_mesh(pv.Sphere(radius=radius, center=center), color="yellow", opacity=0.5)
+            plotter.add_mesh(
+                pv.Sphere(radius=radius, center=center), color="yellow", opacity=0.5
+            )
 
         plotter.show(title="Skeleton and Deformed Mesh", interactive=interactive)
-
 
 
 class InverseKinematicsSolver:
@@ -765,47 +794,61 @@ class InverseKinematicsSolver:
             num_steps (int): Maximum number of optimization steps.
             compute_sdf (bool): Whether to compute mesh SDF for collision.
         """
-        self.fk_solver = FKSolver(model_file=model_file, controlled_bones=controlled_bones,do_compute_sdf=compute_sdf)
+        self.fk_solver = FKSolver(
+            model_file=model_file,
+            controlled_bones=controlled_bones,
+            do_compute_sdf=compute_sdf,
+        )
         self.controlled_bones = self.fk_solver.controlled_bones
 
         # Use limits from URDF if available, otherwise use provided bounds
         if self.fk_solver.limits and not bounds:
             print("Using joint limits from URDF file.")
             urdf_bounds = []
-            
+
             # Load the URDF to get joint information
             if self.fk_solver.file_type == ".urdf":
                 import urchin
+
                 robot = urchin.URDF.load(self.fk_solver.model_file)
                 joint_info = {}
                 for joint in robot.joints:
                     joint_info[joint.child] = {
-                        'type': joint.joint_type,
-                        'axis': joint.axis if hasattr(joint, 'axis') and joint.axis is not None else [0, 0, 1]
+                        "type": joint.joint_type,
+                        "axis": joint.axis
+                        if hasattr(joint, "axis") and joint.axis is not None
+                        else [0, 0, 1],
                     }
-            
+
             for bone_name in self.controlled_bones:
                 if bone_name in self.fk_solver.limits:
                     lower, upper = self.fk_solver.limits[bone_name]
-                    #print(f"Bone '{bone_name}' limits: {lower} to {upper}")
-                    
+                    # print(f"Bone '{bone_name}' limits: {lower} to {upper}")
+
                     # Get joint information
                     if bone_name in joint_info:
-                        joint_type = joint_info[bone_name]['type']
-                        joint_axis = joint_info[bone_name]['axis']
-                        
-                        if joint_type in ['revolute', 'continuous']:
+                        joint_type = joint_info[bone_name]["type"]
+                        joint_axis = joint_info[bone_name]["axis"]
+
+                        if joint_type in ["revolute", "continuous"]:
                             # For revolute joints, apply limits only to the primary rotation axis
                             # Determine which axis has the largest component
                             abs_axis = [abs(x) for x in joint_axis]
                             main_axis = abs_axis.index(max(abs_axis))
-                            
+
                             # Create bounds for X, Y, Z rotations
-                            axis_bounds = [(-10, 10), (-10, 10), (-10, 10)]  # Default small range
-                            axis_bounds[main_axis] = (lower, upper)  # Apply real limits to main axis
-                            
+                            axis_bounds = [
+                                (-10, 10),
+                                (-10, 10),
+                                (-10, 10),
+                            ]  # Default small range
+                            axis_bounds[main_axis] = (
+                                lower,
+                                upper,
+                            )  # Apply real limits to main axis
+
                             urdf_bounds.extend(axis_bounds)
-                            #print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
+                            # print(f"  Applied limits to axis {main_axis}: {axis_bounds}")
                         else:
                             # For other joint types, use conservative limits
                             urdf_bounds.extend([(lower, upper), (-10, 10), (-10, 10)])
@@ -851,7 +894,12 @@ class InverseKinematicsSolver:
             tuple: (final_angles, best_loss, steps)
         """
         X_full = jnp.asarray(initial_rotations, dtype=jnp.float32)
-        mask = jnp.concatenate([jnp.zeros(prefix_len, dtype=bool), jnp.ones(X_full.shape[0] - prefix_len, dtype=bool)])
+        mask = jnp.concatenate(
+            [
+                jnp.zeros(prefix_len, dtype=bool),
+                jnp.ones(X_full.shape[0] - prefix_len, dtype=bool),
+            ]
+        )
 
         steps, best_angles, best_obj, _ = solve_ik(
             init_rot=X_full,
@@ -908,12 +956,17 @@ class InverseKinematicsSolver:
                 ],
                 axis=0,
             )
-            mask = jnp.concatenate([jnp.array([False]), jnp.ones(ik_points, dtype=bool)], axis=0)
+            mask = jnp.concatenate(
+                [jnp.array([False]), jnp.ones(ik_points, dtype=bool)], axis=0
+            )
         else:
             T_current = initial_rotations.shape[0]
             extension = jnp.tile(initial_rotations[-1][None, :], (ik_points, 1))
             X_full = jnp.concatenate([initial_rotations, extension], axis=0)
-            mask = jnp.concatenate([jnp.zeros(T_current, dtype=bool), jnp.ones(ik_points, dtype=bool)], axis=0)
+            mask = jnp.concatenate(
+                [jnp.zeros(T_current, dtype=bool), jnp.ones(ik_points, dtype=bool)],
+                axis=0,
+            )
 
         steps, best_angles, best_obj, _ = solve_ik(
             init_rot=X_full,
@@ -962,6 +1015,7 @@ class InverseKinematicsSolver:
             interactive=interactive,
         )
 
+
 def matrix_to_euler_xyz(R: np.ndarray) -> np.ndarray:
     """
     Convert a 3x3 or 4x4 rotation matrix to XYZ Euler angles.
@@ -989,7 +1043,7 @@ def export_frames(
     initial_rot: np.ndarray,
     solved_angles: np.ndarray,
     controlled_bones: list,
-    export_file: str = "ik_frames.json"
+    export_file: str = "ik_frames.json",
 ) -> None:
     """
     Export a sequence of joint angles to a JSON file.
@@ -1007,12 +1061,21 @@ def export_frames(
 
     frames = []
     if solved_angles.ndim == 1:
-        frame0 = {bone: initial_rot[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
-        frame1 = {bone: solved_angles[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
+        frame0 = {
+            bone: initial_rot[i * 3 : (i + 1) * 3].tolist()
+            for i, bone in enumerate(controlled_bones)
+        }
+        frame1 = {
+            bone: solved_angles[i * 3 : (i + 1) * 3].tolist()
+            for i, bone in enumerate(controlled_bones)
+        }
         frames.extend([frame0, frame1])
     else:
         for frame in solved_angles:
-            frame_dict = {bone: frame[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
+            frame_dict = {
+                bone: frame[i * 3 : (i + 1) * 3].tolist()
+                for i, bone in enumerate(controlled_bones)
+            }
             frames.append(frame_dict)
 
     with open(export_file, "w") as f:
@@ -1023,7 +1086,7 @@ def export_frames(
 def export_all_frames(
     trajectories: list,
     controlled_bones: list,
-    export_file: str = "ik_all_trajectories.json"
+    export_file: str = "ik_all_trajectories.json",
 ) -> None:
     """
     Export multiple trajectories of joint angles to a JSON file.
@@ -1042,12 +1105,21 @@ def export_all_frames(
 
         frames = []
         if solved_angles.ndim == 1:
-            frame0 = {bone: init_rot[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
-            frame1 = {bone: solved_angles[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
+            frame0 = {
+                bone: init_rot[i * 3 : (i + 1) * 3].tolist()
+                for i, bone in enumerate(controlled_bones)
+            }
+            frame1 = {
+                bone: solved_angles[i * 3 : (i + 1) * 3].tolist()
+                for i, bone in enumerate(controlled_bones)
+            }
             frames.extend([frame0, frame1])
         else:
             for frame in solved_angles:
-                frame_dict = {bone: frame[i * 3 : (i + 1) * 3].tolist() for i, bone in enumerate(controlled_bones)}
+                frame_dict = {
+                    bone: frame[i * 3 : (i + 1) * 3].tolist()
+                    for i, bone in enumerate(controlled_bones)
+                }
                 frames.append(frame_dict)
         all_frames.extend(frames)
 
@@ -1057,9 +1129,7 @@ def export_all_frames(
 
 
 def compute_objective_breakdown(
-    X: np.ndarray,
-    objective_list: list,
-    fk_solver: "FKSolver"
+    X: np.ndarray, objective_list: list, fk_solver: "FKSolver"
 ) -> dict:
     """
     Compute the contribution of each objective to the total loss.
@@ -1076,9 +1146,14 @@ def compute_objective_breakdown(
     breakdown = {}
     for name, obj_fn in objective_list:
         contribution = obj_fn(X_tensor, fk_solver)
-        numeric = float(contribution) if isinstance(contribution, (float, np.number)) else float(contribution.item())
+        numeric = (
+            float(contribution)
+            if isinstance(contribution, (float, np.number))
+            else float(contribution.item())
+        )
         breakdown[name] = numeric
     return breakdown
+
 
 def main() -> None:
     """
@@ -1090,14 +1165,45 @@ def main() -> None:
         description="Inverse Kinematics Solver Configuration",
         default_config_files=["config.ini"],
     )
-    parser.add("--model_file", type=str, default="/home/mei/Downloads/robots/pepper_description-master/urdf/pepper.urdf", help="Path to the GLB, GLTF, or URDF model file.")
-    parser.add("--hand", type=str, choices=["left", "right"], default="left", help="For GLTF models, specify hand.")
-    parser.add("--bounds", type=str, default=None, help="JSON string for joint bounds, e.g., '[[-10, 10], ...]'")
-    parser.add("--controlled_bones", type=str, default="[\"LShoulder\",\"LBicep\",\"LForeArm\",\"l_wrist\"]", help="JSON string of bone names to control.")
-    parser.add("--end_effector_bone", type=str, default="LFinger13_link", help="Name of the end-effector bone for the target.")
+    parser.add(
+        "--model_file",
+        type=str,
+        default="/home/mei/Downloads/robots/pepper_description-master/urdf/pepper.urdf",
+        help="Path to the GLB, GLTF, or URDF model file.",
+    )
+    parser.add(
+        "--hand",
+        type=str,
+        choices=["left", "right"],
+        default="left",
+        help="For GLTF models, specify hand.",
+    )
+    parser.add(
+        "--bounds",
+        type=str,
+        default=None,
+        help="JSON string for joint bounds, e.g., '[[-10, 10], ...]'",
+    )
+    parser.add(
+        "--controlled_bones",
+        type=str,
+        default='["LShoulder","LBicep","LForeArm","l_wrist"]',
+        help="JSON string of bone names to control.",
+    )
+    parser.add(
+        "--end_effector_bone",
+        type=str,
+        default="LFinger13_link",
+        help="Name of the end-effector bone for the target.",
+    )
     parser.add("--threshold", type=float, default=0.005)
     parser.add("--num_steps", type=int, default=10000)
-    parser.add("--target_points", type=str, default=None, help="JSON string of target points, e.g., '[[0,0,1], ...]'")
+    parser.add(
+        "--target_points",
+        type=str,
+        default=None,
+        help="JSON string of target points, e.g., '[[0,0,1], ...]'",
+    )
     parser.add("--learning_rate", type=float, default=0.2)
     parser.add("--additional_objective_weight", type=float, default=0.25)
     parser.add("--subpoints", type=int, default=5)
@@ -1113,23 +1219,30 @@ def main() -> None:
     if file_type == ".urdf":
         # For URDF, user must specify controlled bones and end effector
         if not args.controlled_bones or not args.end_effector_bone:
-            raise ValueError("For URDF files, --controlled_bones and --end_effector_bone must be provided.")
+            raise ValueError(
+                "For URDF files, --controlled_bones and --end_effector_bone must be provided."
+            )
         controlled_bones = json.loads(args.controlled_bones)
         end_effector = args.end_effector_bone
         bounds = json.loads(args.bounds) if args.bounds else None
     else:  # GLTF/GLB
         hand = args.hand
-        controlled_bones = [f"{hand}_collar", f"{hand}_shoulder", f"{hand}_elbow", f"{hand}_wrist"]
+        controlled_bones = [
+            f"{hand}_collar",
+            f"{hand}_shoulder",
+            f"{hand}_elbow",
+            f"{hand}_wrist",
+        ]
         end_effector = f"{hand}_index3"
         if args.bounds is None:
-            bounds = [(-60, 60)] * 3 * len(controlled_bones) # Default wide bounds
+            bounds = [(-60, 60)] * 3 * len(controlled_bones)  # Default wide bounds
         else:
             bounds = [tuple(b) for b in json.loads(args.bounds)]
 
     if args.target_points:
         targets = [np.array(p) for p in json.loads(args.target_points)]
     else:
-        targets = [np.array([0.3, 0.3, 0.35])] # Default target
+        targets = [np.array([0.3, 0.3, 0.35])]  # Default target
 
     # --- Initialize Solver ---
     solver = InverseKinematicsSolver(
@@ -1153,7 +1266,9 @@ def main() -> None:
         missing_bones.append(end_effector)
 
     if missing_bones:
-        print(f"Error: The following bones were not found in the skeleton: {missing_bones}")
+        print(
+            f"Error: The following bones were not found in the skeleton: {missing_bones}"
+        )
         print("Please check the bone names and update the configuration.")
         return
 
@@ -1167,15 +1282,22 @@ def main() -> None:
     # --- Solve for Targets ---
     start_time = time.time()
     for i, target in enumerate(tqdm(targets, desc="Solving IK")):
-        mandatory_obj_fns = [DistanceObjTraj(target_points=[target], bone_name=end_effector, use_head=True, weight=1.0)]
+        mandatory_obj_fns = [
+            DistanceObjTraj(
+                target_points=[target],
+                bone_name=end_effector,
+                use_head=True,
+                weight=1.0,
+            )
+        ]
         optional_obj_fns = [
             BoneZeroRotationObj(weight=args.additional_objective_weight),
             SDFSelfCollisionPenaltyObj(
                 bone_names=controlled_bones,
                 num_samples_per_bone=5,
                 min_dist=0.02,
-                weight=1.0
-            )
+                weight=1.0,
+            ),
         ]
 
         best_angles, obj, steps = solver.solve(
@@ -1194,11 +1316,8 @@ def main() -> None:
 
     # --- Render Final Pose ---
     print("Rendering final pose...")
-    solver.render(
-        angle_vector=final_angles,
-        target_pos=targets,
-        interactive=True
-    )
+    solver.render(angle_vector=final_angles, target_pos=targets, interactive=True)
+
 
 if __name__ == "__main__":
     main()

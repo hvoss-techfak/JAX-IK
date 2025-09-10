@@ -198,7 +198,9 @@ class DistanceObjTraj(ObjectiveFunction):
         X_traj = X.reshape(1, -1) if X.ndim == 1 else X
 
         # FK for every frame
-        bone_pts = jax.vmap(lambda cfg: self._bone_point(cfg, fk_solver))(X_traj)  # (T, 3)
+        bone_pts = jax.vmap(lambda cfg: self._bone_point(cfg, fk_solver))(
+            X_traj
+        )  # (T, 3)
 
         T = bone_pts.shape[0]
         if T == 0 or self.rat.size == 0:
@@ -211,7 +213,6 @@ class DistanceObjTraj(ObjectiveFunction):
         return jnp.mean(jnp.square(diff)) * self.weight
 
 
-
 @register_pytree_node_class
 class BoneRelativeLookObj(ObjectiveFunction):
     """
@@ -220,11 +221,7 @@ class BoneRelativeLookObj(ObjectiveFunction):
     """
 
     def __init__(
-        self,
-        bone_name: str,
-        use_head: bool,
-        modifications: list,
-        weight: float = 1.0
+        self, bone_name: str, use_head: bool, modifications: list, weight: float = 1.0
     ):
         """
         Args:
@@ -277,14 +274,14 @@ class BoneRelativeLookObj(ObjectiveFunction):
         return misalign * self.weight
 
     def update_params(self, params: dict) -> None:  # custom handling for modifications
-        if 'modifications' in params:
-            mods = params['modifications'] or []
+        if "modifications" in params:
+            mods = params["modifications"] or []
             self.mod_idx = jnp.asarray([m[0] for m in mods], jnp.int32)
             self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
-        if 'weight' in params:
-            self.weight = jnp.asarray(params['weight'], jnp.float32)
-        if 'use_head' in params:
-            self.use_head = bool(params['use_head'])
+        if "weight" in params:
+            self.weight = jnp.asarray(params["weight"], jnp.float32)
+        if "use_head" in params:
+            self.use_head = bool(params["use_head"])
         # ignore unknown keys (no-op)
 
 
@@ -292,12 +289,7 @@ class BoneRelativeLookObj(ObjectiveFunction):
 class DerivativeObj(ObjectiveFunction):
     """Velocity (1), acceleration (2) or jerk (3) regulariser on the trajectory."""
 
-    def __init__(
-        self,
-        order: int,
-        weight: float,
-        next_frames: np.ndarray = None
-    ):
+    def __init__(self, order: int, weight: float, next_frames: np.ndarray = None):
         """
         Args:
             order (int): Derivative order (1=velocity, 2=acceleration, 3=jerk).
@@ -346,8 +338,8 @@ class DerivativeObj(ObjectiveFunction):
         return jnp.mean(jnp.square(diff)) * self.weight
 
     def update_params(self, params: dict) -> None:
-        if 'weight' in params:
-            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        if "weight" in params:
+            self.weight = jnp.asarray(params["weight"], jnp.float32)
         # order treated static; ignore updates
 
 
@@ -365,7 +357,7 @@ class CombinedDerivativeObj(ObjectiveFunction):
         max_order: int,
         weight: float = 1.0,
         weights: list = None,
-        next_frames: np.ndarray = None
+        next_frames: np.ndarray = None,
     ):
         """
         Args:
@@ -382,7 +374,9 @@ class CombinedDerivativeObj(ObjectiveFunction):
         # Otherwise use the same weight for all orders
         if weights is not None:
             if len(weights) != max_order:
-                raise ValueError(f"weights must have length {max_order} for max_order {max_order}")
+                raise ValueError(
+                    f"weights must have length {max_order} for max_order {max_order}"
+                )
             self.weights = jnp.asarray(weights, jnp.float32)
         else:
             self.weights = jnp.full(max_order, weight, dtype=jnp.float32)
@@ -434,11 +428,11 @@ class CombinedDerivativeObj(ObjectiveFunction):
         return total_loss
 
     def update_params(self, params: dict) -> None:
-        if 'weights' in params:
-            w = params['weights']
+        if "weights" in params:
+            w = params["weights"]
             self.weights = jnp.asarray(w, jnp.float32)
-        elif 'weight' in params:
-            self.weights = jnp.full(self.max_order, params['weight'], dtype=jnp.float32)
+        elif "weight" in params:
+            self.weights = jnp.full(self.max_order, params["weight"], dtype=jnp.float32)
 
 
 @register_pytree_node_class
@@ -468,8 +462,11 @@ class InitPoseObj(ObjectiveFunction):
         self.last_position = bool(last_position)
         self.weight = jnp.asarray(weight, jnp.float32)
 
-        self.mask = jnp.ones_like(self.init_rot) if mask is None else jnp.asarray(mask, jnp.float32).reshape(-1)
-
+        self.mask = (
+            jnp.ones_like(self.init_rot)
+            if mask is None
+            else jnp.asarray(mask, jnp.float32).reshape(-1)
+        )
 
     def _loss_single(self, pose: jnp.ndarray) -> jnp.ndarray:
         """
@@ -555,7 +552,7 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         sphere_collider: dict,
         weight: float = 1.0,
         min_clearance: float = 0.05,
-        segment_radius: float = 0.02
+        segment_radius: float = 0.02,
     ):
         """
         Args:
@@ -569,7 +566,6 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         self.min_clearance = jnp.asarray(min_clearance, jnp.float32)
         self.segment_radius = jnp.asarray(segment_radius, jnp.float32)
         self.weight = jnp.asarray(weight, jnp.float32)
-
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -623,8 +619,8 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         return loss * self.weight
 
     def update_params(self, params: dict) -> None:
-        if 'weight' in params:
-            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        if "weight" in params:
+            self.weight = jnp.asarray(params["weight"], jnp.float32)
 
 
 @register_pytree_node_class
@@ -638,7 +634,7 @@ class BoneDirectionObjective(ObjectiveFunction):
         bone_name: str,
         use_head: bool = True,
         directions: list = None,
-        weight: float = 1.0
+        weight: float = 1.0,
     ):
         """
         Args:
@@ -657,7 +653,6 @@ class BoneDirectionObjective(ObjectiveFunction):
             self.raw_directions = [[0, 1, 0]]
             self.directions = jnp.array([[0, 1, 0]], dtype=jnp.float32)
         self.weight = jnp.asarray(weight, dtype=jnp.float32)
-
 
     def _loss_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -683,7 +678,9 @@ class BoneDirectionObjective(ObjectiveFunction):
 
         # Combine directions: sum then normalize
         combined_direction = jnp.sum(self.directions, axis=0)
-        desired_direction = combined_direction / (jnp.linalg.norm(combined_direction) + 1e-6)
+        desired_direction = combined_direction / (
+            jnp.linalg.norm(combined_direction) + 1e-6
+        )
 
         # Calculate dot product and angle
         dot_product = jnp.sum(bone_vector_normalized * desired_direction)
@@ -711,8 +708,6 @@ class BoneDirectionObjective(ObjectiveFunction):
         return jnp.mean(losses) * self.weight
 
 
-
-
 @register_pytree_node_class
 class BoneZeroRotationObj(ObjectiveFunction):
     """
@@ -726,7 +721,11 @@ class BoneZeroRotationObj(ObjectiveFunction):
             mask (np.ndarray): Optional mask for which angles to penalize.
         """
         self.weight = jnp.asarray(weight, jnp.float32)
-        self.mask = jnp.ones([1], jnp.float32) if mask is None else jnp.asarray(mask, jnp.float32)
+        self.mask = (
+            jnp.ones([1], jnp.float32)
+            if mask is None
+            else jnp.asarray(mask, jnp.float32)
+        )
 
     def _masked_sq_norm(self, pose: jnp.ndarray) -> jnp.ndarray:
         """Compute masked squared norm of a single pose (mean over dims)."""
@@ -750,6 +749,7 @@ class BoneZeroRotationObj(ObjectiveFunction):
         poses = X.reshape(-1, X.shape[-1]) if X.ndim > 1 else X[None, :]
         return jnp.mean(jax.vmap(self._masked_sq_norm)(poses)) * self.weight
 
+
 @register_pytree_node_class
 class SDFCollisionPenaltyObj(ObjectiveFunction):
     """
@@ -757,11 +757,7 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
     """
 
     def __init__(
-        self,
-        bone_name: str,
-        sdf: dict,
-        num_samples: int = 10,
-        weight: float = 1.0
+        self, bone_name: str, sdf: dict, num_samples: int = 10, weight: float = 1.0
     ):
         """
         Args:
@@ -789,7 +785,9 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         """
         coords = (points - self.sdf_origin) / self.sdf_spacing
         # Use JAX's map_coordinates for interpolation
-        return jax.scipy.ndimage.map_coordinates(self.sdf_grid, coords.T, order=1, mode='constant', cval=jnp.inf)
+        return jax.scipy.ndimage.map_coordinates(
+            self.sdf_grid, coords.T, order=1, mode="constant", cval=jnp.inf
+        )
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -829,8 +827,8 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         return jnp.mean(losses) * self.weight
 
     def update_params(self, params: dict) -> None:
-        if 'weight' in params:
-            self.weight = jnp.asarray(params['weight'], jnp.float32)
+        if "weight" in params:
+            self.weight = jnp.asarray(params["weight"], jnp.float32)
 
 
 @register_pytree_node_class
@@ -844,7 +842,7 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         bone_names: list,
         num_samples_per_bone: int = 5,
         min_dist: float = 0.0,
-        weight: float = 1.0
+        weight: float = 1.0,
     ):
         """
         Args:
@@ -870,7 +868,9 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
             jnp.ndarray: SDF values at the points.
         """
         coords = (points - sdf["origin"]) / sdf["spacing"]
-        return jax.scipy.ndimage.map_coordinates(sdf["grid"], coords.T, order=1, mode='constant', cval=jnp.inf)
+        return jax.scipy.ndimage.map_coordinates(
+            sdf["grid"], coords.T, order=1, mode="constant", cval=jnp.inf
+        )
 
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -883,8 +883,12 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         Returns:
             jnp.ndarray: Penalty value.
         """
-        if not hasattr(fk_solver, 'sdf') or fk_solver.sdf is None or \
-           not hasattr(fk_solver, 'mesh_data') or fk_solver.mesh_data is None:
+        if (
+            not hasattr(fk_solver, "sdf")
+            or fk_solver.sdf is None
+            or not hasattr(fk_solver, "mesh_data")
+            or fk_solver.mesh_data is None
+        ):
             return 0.0
 
         fk = fk_solver.compute_fk_from_angles(cfg)
@@ -903,7 +907,9 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         query_points_world = jnp.concatenate(all_points, axis=0)
 
         # Transform points back to rest-pose local space
-        query_points_local = inverse_skin_points(query_points_world, fk_solver, fk_solver.mesh_data, fk)
+        query_points_local = inverse_skin_points(
+            query_points_world, fk_solver, fk_solver.mesh_data, fk
+        )
 
         # Query SDF
         distances = self._get_sdf_value(query_points_local, fk_solver.sdf)
@@ -929,7 +935,7 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         return jnp.mean(losses) * self.weight
 
     def update_params(self, params: dict) -> None:
-        if 'weight' in params:
-            self.weight = jnp.asarray(params['weight'], jnp.float32)
-        if 'min_dist' in params:
-            self.min_dist = jnp.float32(params['min_dist'])
+        if "weight" in params:
+            self.weight = jnp.asarray(params["weight"], jnp.float32)
+        if "min_dist" in params:
+            self.min_dist = jnp.float32(params["min_dist"])
