@@ -547,13 +547,7 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
     Keep every bone segment outside a sphere collider.
     """
 
-    def __init__(
-        self,
-        sphere_collider: dict,
-        weight: float = 1.0,
-        min_clearance: float = 0.05,
-        segment_radius: float = 0.02,
-    ):
+    def __init__(self, sphere_collider: dict, weight: float = 1.0, min_clearance: float = 0.05, segment_radius: float = 0.02):
         """
         Args:
             sphere_collider (dict): Dictionary with 'center' and 'radius' keys.
@@ -578,28 +572,22 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         Returns:
             jnp.ndarray: Penalty value.
         """
-        fk = fk_solver.compute_fk_from_angles(cfg)
-        total = 0.0
+        fk = fk_solver.compute_fk_from_angles(cfg)  # (N,4,4)
+        heads = fk[:, :3, 3]  # (N,3)
+        parents = jnp.asarray(fk_solver.parent_list, jnp.int32)  # (N,)
+        seg_mask = (parents >= 0).astype(jnp.float32)  # (N,)
+        safe_parent_indices = jnp.where(parents >= 0, parents, 0)
+        p_head = heads[safe_parent_indices]
+        c_head = heads
+        v = c_head - p_head
+        dot_vv = jnp.sum(v * v, axis=1) + 1e-6
         eff_rad = self.radius + self.min_clearance + self.segment_radius
-
-        for i, parent in enumerate(fk_solver.parent_list):
-            if parent < 0:
-                continue
-            pb = fk_solver.bone_names[parent]
-            cb = fk_solver.bone_names[i]
-
-            p_head, _ = fk_solver.get_bone_head_tail_from_fk(fk, pb)
-            c_head, _ = fk_solver.get_bone_head_tail_from_fk(fk, cb)
-
-            v = c_head - p_head
-            dot_vv = jnp.dot(v, v) + 1e-6
-            t = jnp.clip(jnp.dot(self.center - p_head, v) / dot_vv, 0.0, 1.0)
-            closest = p_head + t * v
-
-            dist = jnp.linalg.norm(self.center - closest)
-            penetration = jnp.maximum(0.0, eff_rad - dist)
-            total += penetration**2
-        return total
+        vc = self.center - p_head
+        t = jnp.clip(jnp.sum(vc * v, axis=1) / dot_vv, 0.0, 1.0)
+        closest = p_head + t[:, None] * v
+        dist = jnp.linalg.norm(self.center - closest, axis=1)
+        penetration = jnp.maximum(0.0, eff_rad - dist)
+        return jnp.sum((penetration ** 2) * seg_mask)
 
     def __call__(self, X: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -616,12 +604,11 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
             loss = self._penalty_single(X, fk_solver)
         else:
             loss = jnp.mean(jax.vmap(lambda c: self._penalty_single(c, fk_solver))(X))
-        return loss * self.weight
+        return loss * jnp.float32(self.weight)
 
     def update_params(self, params: dict) -> None:
         if "weight" in params:
             self.weight = jnp.asarray(params["weight"], jnp.float32)
-
 
 @register_pytree_node_class
 class BoneDirectionObjective(ObjectiveFunction):
