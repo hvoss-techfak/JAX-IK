@@ -4,7 +4,7 @@
 
 Real-time inverse kinematics in pure JAX with differentiable objectives, trajectory support, and optional SDF-based self-collision.
 
-- Paper: Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters
+- Paper: Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters: https://arxiv.org/abs/2507.00792
 - Website: https://hvoss-techfak.github.io/JAX-IK/
 - Demo (HF Space): https://huggingface.co/spaces/hvoss-techfak/JAX-IK
 
