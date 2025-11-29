@@ -2,11 +2,17 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/jax-ik.svg)](https://pypi.org/project/jax-ik/) [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/) [![CI](https://github.com/hvoss-techfak/JAX-IK/actions/workflows/python-app.yml/badge.svg)](https://github.com/hvoss-techfak/JAX-IK/actions/workflows/python-app.yml)
 
+
+
 Real-time inverse kinematics in pure JAX with differentiable objectives, trajectory support, and optional SDF-based self-collision.
 
 - Paper: Real-Time Inverse Kinematics for Generating Multi-Constrained Movements of Virtual Human Characters: https://arxiv.org/abs/2507.00792
 - Website: https://hvoss-techfak.github.io/JAX-IK/
 - Demo (HF Space): https://huggingface.co/spaces/hvoss-techfak/JAX-IK
+
+<p align="center">
+  <img src="static/full.png" alt="full" width="60%">
+</p>
 
 
 ## Highlights
@@ -17,6 +23,7 @@ Real-time inverse kinematics in pure JAX with differentiable objectives, traject
 - Optional SDF-based self-collision using mesh_to_sdf (falls back to trimesh)
 - Simple forward kinematics (FK) API, plus helpers to deform meshes (LBS or rigid) for visualization
 - Clean CLI for quick experiments and interactive PyVista rendering
+
 
 
 ## Installation
@@ -228,6 +235,12 @@ We do not distribute SMPL-X meshes or skeletons. To obtain a GLB with SMPL-X:
 - Use the add-on to create a character in Blender
 - Export via File → Export → glTF 2.0 (.glb) and reference that file in examples/CLI
 
+## Paper evaluation
+This is the result of the evaluation, showing the average time taken by each IK algorithm in different configurations.
+As you can see with the newest version of Jax, the jax implementation is now significantly faster than the newest
+tensorflow version. \
+This was calculated with Jax 0.6.2 and Tensorflow 2.19.0
+![table_all.png](paper_evaluation/table_all.png)
 
 ## Troubleshooting
 
