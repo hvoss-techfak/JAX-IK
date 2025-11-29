@@ -229,7 +229,7 @@ Typical flow:
 
 ## SMPL-X assets note
 
-We do not distribute SMPL-X meshes or skeletons. To obtain a GLB with SMPL-X:
+We are not allowed to distribute SMPL-X meshes or skeletons. To obtain a GLB with SMPL-X:
 
 - Install the SMPL-X Blender Add-on: https://github.com/Meshcapade/SMPL_blender_addon
 - Use the add-on to create a character in Blender
