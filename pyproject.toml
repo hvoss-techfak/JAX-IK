@@ -19,7 +19,7 @@ dependencies = [
     "pygltflib>=1.16.3",
     "urchin>=0.0.29",
     "trimesh>=4.6.4",
-    "tqdm>=4.67.1",
+    "tqdm",
     "networkx>=3.4",
     "rtree>=1.4.0",
     "mesh_to_sdf>=0.0.15",
