@@ -1,0 +1,105 @@
+name: IK Evaluation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies (TRAC-IK + IKFast)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            build-essential \
+            cmake \
+            pkg-config \
+            libboost-all-dev \
+            libeigen3-dev \
+            liborocos-kdl-dev \
+            libnlopt-dev \
+            libnlopt-cxx-dev \
+            libblas-dev \
+            liblapack-dev
+
+      - name: Install repo + Python deps
+        env:
+          # CI is CPU-only; avoid trying to install NVIDIA CUDA plugin.
+          JAX_IK_CI: "1"
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU JAX explicitly first to avoid pulling jax-cuda12-plugin from pyproject.
+          python -m pip install "jax[cpu]" -f https://storage.googleapis.com/jax-releases/jax_releases.html
+          # Install this repo in editable mode but without deps (handled manually here).
+          python -m pip install -e . --no-deps
+          # Install remaining runtime deps for this project.
+          python -m pip install \
+            numpy \
+            configargparse>=1.7 \
+            pyvista>=0.45.2 \
+            pygltflib>=1.16.3 \
+            urchin>=0.0.29 \
+            trimesh>=4.6.4 \
+            tqdm \
+            networkx>=3.4 \
+            rtree>=1.4.0 \
+            mesh_to_sdf>=0.0.15
+
+      - name: Install comparison solvers (ikpy)
+        run: |
+          python -m pip install ikpy
+
+      - name: Install comparison solvers (pytracik)
+        run: |
+          rm -rf /tmp/pytracik
+          git clone --depth 1 https://github.com/chenhaox/pytracik.git /tmp/pytracik
+          cd /tmp/pytracik
+          python -m pip install -r requirements.txt
+          python setup_linux.py install
+
+      - name: Install comparison solvers (ur_ikfast)
+        run: |
+          rm -rf /tmp/ur_ikfast
+          git clone --depth 1 https://github.com/cambel/ur_ikfast.git /tmp/ur_ikfast
+          cd /tmp/ur_ikfast
+          python -m pip install numpy Cython
+          python -m pip install -e .
+
+      - name: Run evaluation
+        run: |
+          mkdir -p artifacts
+
+          # Evaluate all URDFs shipped in this repo.
+          for urdf in $(ls -1 **/*.urdf 2>/dev/null | grep -v '^jax_cache/' | sort -u); do
+            stem=$(basename "$urdf" .urdf)
+            out="artifacts/${stem}.csv"
+            python new_eval/llm_ik_evaluation.py \
+              --urdf "$urdf" \
+              --tests 50 \
+              --warmup 2 \
+              --methods "jax-ik,ikpy,ikfast,trac-ik" \
+              --output-csv "$out"
+          done
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik-evaluation-csv
+          path: artifacts/*.csv
+          if-no-files-found: error
+

@@ -356,9 +356,9 @@ def _solve_ik_core(
     mandatory_obj_fns: tuple,
     optional_obj_fns: tuple,
     fksolver: "FKSolver",
-    threshold: float = 0.01,
+    threshold: float = 0.001,
     num_steps: int = 1000,
-    learning_rate: float = 0.1,
+    learning_rate: float = 0.0001,
     beta1: float = 0.9,
     beta2: float = 0.999,
     epsilon: float = 1e-8,
@@ -810,7 +810,7 @@ class InverseKinematicsSolver:
             if self.fk_solver.file_type == ".urdf":
                 import urchin
 
-                robot = urchin.URDF.load(self.fk_solver.model_file)
+                robot = urchin.URDF.load(self.fk_solver.model_file, lazy_load_meshes=True)
                 joint_info = {}
                 for joint in robot.joints:
                     joint_info[joint.child] = {

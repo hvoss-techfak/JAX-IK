@@ -278,7 +278,11 @@ def load_skeleton_from_urdf(urdf_file: str) -> tuple[dict, dict]:
             - skeleton (dict): Bone hierarchy.
             - limits (dict): Joint limits per bone.
     """
-    robot = urchin.URDF.load(urdf_file)
+    # NOTE: many public URDFs reference meshes via `package://...` URIs which won't
+    # resolve unless the ROS package path is configured. We only need joint
+    # hierarchy + limits here, so disable mesh loading for the ik model.
+    # If this is needed later, we need to reactivate it for visualizing
+    robot = urchin.URDF.load(urdf_file, lazy_load_meshes=True)
     skeleton = {}
     limits = {}
 

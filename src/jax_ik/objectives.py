@@ -286,6 +286,71 @@ class BoneRelativeLookObj(ObjectiveFunction):
 
 
 @register_pytree_node_class
+class EndEffectorOrientationObj(ObjectiveFunction):
+    """Penalize end-effector orientation error for a URDF link.
+
+    Uses stable quaternion geodesic distance on SO(3):
+    angle(R_target^T R_current) = 2*acos(|w|)
+
+    """
+
+    def __init__(
+        self, bone_name: str, target_transform: np.ndarray, weight: float = 1.0
+    ):
+        import jax.numpy as jnp
+
+        self.bone_name = bone_name
+        self.target_R = jnp.asarray(
+            np.asarray(target_transform, dtype=np.float32)[:3, :3], dtype=jnp.float32
+        )
+        self.weight = jnp.asarray(weight, dtype=jnp.float32)
+
+    def tree_flatten(self):
+        return (self.target_R, self.weight), {"bone_name": self.bone_name}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        import jax.numpy as jnp
+
+        target_R, weight = children
+        obj = cls.__new__(cls)
+        obj.bone_name = aux_data["bone_name"]
+        obj.target_R = jnp.asarray(target_R, dtype=jnp.float32)
+        obj.weight = jnp.asarray(weight, dtype=jnp.float32)
+        return obj
+
+    @staticmethod
+    def _quat_w_from_R(R):
+        """Return the absolute w component of unit quaternion for rotation matrix R.
+
+        Stable formula: w = sqrt(max(0, (trace(R)+1)/4)).
+        We only need w for the SO(3) angle.
+        """
+        import jax.numpy as jnp
+
+        tr = jnp.trace(R)
+        w2 = jnp.maximum(jnp.float32(0.0), (tr + jnp.float32(1.0)) * jnp.float32(0.25))
+        w = jnp.sqrt(w2)
+        # In case numerical drift makes w slightly > 1, clip.
+        return jnp.clip(jnp.abs(w), jnp.float32(0.0), jnp.float32(1.0))
+
+    def __call__(self, X, fk_solver):
+        import jax.numpy as jnp
+
+        cfg = X if X.ndim == 1 else X[-1]
+        fk = fk_solver.compute_fk_from_angles(cfg)
+        idx = fk_solver.bone_names.index(self.bone_name)
+        R = fk[idx][:3, :3]
+
+        R_rel = self.target_R.T @ R
+
+        w = self._quat_w_from_R(R_rel)
+        # Avoid NaN gradients at the boundary by keeping away from exactly 1.0
+        w = jnp.clip(w, jnp.float32(0.0), jnp.float32(1.0) - jnp.float32(1e-7))
+        angle = jnp.float32(2.0) * jnp.arccos(w)  # radians in [0, pi]
+        return jnp.square(angle) * self.weight
+
+@register_pytree_node_class
 class DerivativeObj(ObjectiveFunction):
     """Velocity (1), acceleration (2) or jerk (3) regulariser on the trajectory."""
 
