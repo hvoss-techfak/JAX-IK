@@ -78,7 +78,8 @@ jobs:
           git clone --depth 1 https://github.com/cambel/ur_ikfast.git /tmp/ur_ikfast
           cd /tmp/ur_ikfast
           python -m pip install numpy Cython
-          python -m pip install -e .
+          # ur_ikfast's build backend imports Cython at setup-time; disable build isolation so it can see Cython.
+          python -m pip install -e . --no-build-isolation
 
       - name: Run evaluation
         run: |
