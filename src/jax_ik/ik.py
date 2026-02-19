@@ -873,7 +873,7 @@ class InverseKinematicsSolver:
     def solve_guess(
         self,
         initial_rotations: np.ndarray,
-        learning_rate: float = 0.2,
+        learning_rate: float = 0.001,
         mandatory_objective_functions: tuple = (),
         optional_objective_functions: tuple = (),
         prefix_len: int = 1,
@@ -919,7 +919,7 @@ class InverseKinematicsSolver:
     def solve(
         self,
         initial_rotations: np.ndarray = None,
-        learning_rate: float = 0.2,
+        learning_rate: float = 0.001,
         mandatory_objective_functions: tuple = (),
         optional_objective_functions: tuple = (),
         ik_points: int = 1,
@@ -1204,7 +1204,7 @@ def main() -> None:
         default=None,
         help="JSON string of target points, e.g., '[[0,0,1], ...]'",
     )
-    parser.add("--learning_rate", type=float, default=0.2)
+    parser.add("--learning_rate", type=float, default=0.001)
     parser.add("--additional_objective_weight", type=float, default=0.25)
     parser.add("--subpoints", type=int, default=5)
     parser.add("--render", action="store_true", help="Render the final pose.")

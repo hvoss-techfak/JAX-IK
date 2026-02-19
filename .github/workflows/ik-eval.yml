@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
 
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -83,24 +88,37 @@ jobs:
 
       - name: Run evaluation
         run: |
+          set -euo pipefail
+
           mkdir -p artifacts
 
           # Evaluate all URDFs shipped in this repo.
-          for urdf in $(ls -1 **/*.urdf 2>/dev/null | grep -v '^jax_cache/' | sort -u); do
+          # Use find instead of bash globstar so it works reliably in CI.
+          while IFS= read -r -d '' urdf; do
+            # Normalize to a repo-relative path for logging.
+            rel=${urdf#"$PWD/"}
             stem=$(basename "$urdf" .urdf)
             out="artifacts/${stem}.csv"
-            python new_eval/llm_ik_evaluation.py \
-              --urdf "$urdf" \
+
+            echo "Evaluating URDF: ${rel} -> ${out}"
+
+            python -u new_eval/llm_ik_evaluation.py \
+              --urdf "$rel" \
               --tests 50 \
               --warmup 2 \
               --methods "jax-ik,ikpy,ikfast,trac-ik" \
               --output-csv "$out"
-          done
+          done < <(find . -type f -name '*.urdf' -not -path './jax_cache/*' -print0 | sort -z)
+
+          echo "Generated CSVs:"
+          ls -lah artifacts | cat
 
       - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ik-evaluation-csv
-          path: artifacts/*.csv
+          path: |
+            artifacts/**/*.csv
+            artifacts/*.csv
           if-no-files-found: error
 

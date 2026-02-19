@@ -1,804 +1,500 @@
-import argparse
 import random
 import time
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
+
+from trac_ik import TracIK
+from ur_ikfast import ur_kinematics
+import ikpy.chain
 
 from jax_ik.ik import InverseKinematicsSolver
 from jax_ik.objectives import DistanceObjTraj, EndEffectorOrientationObj
 
-# Optional baseline solvers (only used when explicitly requested).
-try:
-    import ikpy.chain  # type: ignore
-except Exception:  # pragma: no cover
-    print("Warning: IKPy not available. IKPy results will be skipped.")
-    ikpy = None  # type: ignore
+# The total number of tests.
+TESTS = 10000
 
-try:
-    from trac_ik import TracIK  # type: ignore
-except Exception:  # pragma: no cover
-    print("Warning: TRAC-IK not available. TRAC-IK results will be skipped.")
-    TracIK = None  # type: ignore
+SEED = 42
 
-try:
-    from ur_ikfast import ur_kinematics  # type: ignore
-except Exception:  # pragma: no cover
-    print("Warning: IKFast UR kinematics not available. IKFast results will be skipped.")
-    ur_kinematics = None  # type: ignore
+DISTANCE_ERROR = 0.01
+ANGLE_ERROR = 1
+
+# Default bounding value.
+BOUND = 2 * np.pi
+
+# Ensure consistent results.
+random.seed(SEED)
+np.random.seed(SEED)
+
+robot_ikfast = ur_kinematics.URKinematics('ur5')
+robot_trac_ik = TracIK(urdf_path="models/UR5.urdf", base_link_name="base_link", tip_link_name="tool0")
 
 
-@dataclass
-class Stats:
-    success: int = 0
-    elapsed: float = 0.0
-    failure_distance_sum: float = 0.0
-    failure_angle_sum_deg: float = 0.0
+class IKPyRobotAdapter:
+    """Tiny IKPy wrapper exposing the methods used by this benchmark.
+
+    This keeps `additional.py` runnable without importing `llm_ik.py`.
+    """
+
+    def __init__(self, urdf_path: str, base_elements: list[str] | None = None):
+        # `base_elements` can be used to skip non-chain links if needed.
+        self.chain = ikpy.chain.Chain.from_urdf_file(urdf_path, base_elements=base_elements)
+
+    @property
+    def links(self):
+        return self.chain.links
+
+    def forward_kinematics(self, lower: int, upper: int, joints: list[float]):
+        """Return lists of positions and rotations for each joint in [lower, upper].
+
+        Note: this benchmark only ever uses the final element (end-effector pose).
+        Different IKPy versions expose different APIs for per-link FK, so we compute
+        the full-chain FK once and replicate it for the requested joint range.
+        """
+        # IKPy expects a joint vector aligned with `chain.links` length.
+        # Many URDFs include extra fixed/end-effector links, so we pad with zeros.
+        full = [0.0] + list(joints)
+        if len(full) < len(self.chain.links):
+            full = full + [0.0] * (len(self.chain.links) - len(full))
+        fk = self.chain.forward_kinematics(full)
+        pos = fk[:3, 3]
+        rot = fk[:3, :3]
+        count = max(0, upper - lower + 1)
+        return [pos] * count, [rot] * count
+
+    def inverse_kinematics(self, lower: int, upper: int, target_position, target_orientation):
+        """Solve IK with IKPy; return (solution, distance_error, angle_error, elapsed)."""
+        target_position = np.asarray(target_position, dtype=float)
+        target_orientation = np.asarray(target_orientation, dtype=float)
+
+        start_time = time.perf_counter()
+        try:
+            # IKPy uses orientation_mode="all" with a 3x3 rotation matrix.
+            sol_full = self.chain.inverse_kinematics(
+                target_position=target_position,
+                target_orientation=target_orientation,
+                orientation_mode="all",
+            )
+        except TypeError:
+            # Older IKPy versions use positional args.
+            sol_full = self.chain.inverse_kinematics(target_position, target_orientation)
+        elapsed = time.perf_counter() - start_time
+
+        # Drop base joint; keep the first 6 actuated joints.
+        solution = np.asarray(sol_full[1:7], dtype=float)
+        positions, orientations = self.forward_kinematics(lower, upper, solution.tolist())
+        distance = difference_distance(target_position, positions[-1])
+        angle = difference_angle(target_orientation, orientations[-1])
+        return solution, distance, angle, elapsed
+
+
+# Create IKPy baseline/target generator.
+robot_llm_ik = IKPyRobotAdapter("models/UR5.urdf")
+
+# Cache joint limits, just in case the representations of the robot differ slightly in different implementations.
+# We use IKPy's URDF bounds as the sampling range.
+#
+bounds_llm_ik: list[tuple[float, float]] = []
+for link in robot_llm_ik.links:
+    # Skip fixed joints and the base link.
+    if getattr(link, "joint_type", None) == "fixed":
+        continue
+    bounds = getattr(link, "bounds", None)
+    # Prefer URDF-provided limits; if they're missing/unbounded, fall back to [-pi, pi]
+    if bounds is None or bounds == (-np.inf, np.inf):
+        bounds_llm_ik.append((-np.pi*2, np.pi*2))
+    else:
+        bounds_llm_ik.append(bounds)
+# URDFs often include a base link without bounds; ensure we have 6 sampled joints.
+if len(bounds_llm_ik) > 6:
+    bounds_llm_ik = bounds_llm_ik[:6]
+
+if len(bounds_llm_ik) != 6:
+    raise RuntimeError(f"Expected 6 IKPy joint bounds for UR5, got {len(bounds_llm_ik)}")
+
+
+def _sample_canonical_joints() -> np.ndarray:
+    """Sample one 6-DOF UR5 joint vector (radians) from IKPy URDF bounds."""
+    return np.asarray(
+        [random.uniform(bounds_llm_ik[j][0], bounds_llm_ik[j][1]) for j in range(6)],
+        dtype=np.float32,
+    )
+
+# Define data caches.
+cache: dict[str, dict[str, float]] = {}
+for entry in ["IKPy", "IKFast", "TRAC-IK", "JAX-IK"]:
+    cache[entry] = {"Success": 0, "Elapsed": 0, "Distance": 0, "Angle": 0}
+
+def reached(distance: float = 0, angle: float = 0) -> bool:
+    """Determine if a target has been reached.
+
+    `distance`/`angle` may be Python floats, NumPy scalars, or small NumPy arrays
+    depending on which solver produced them.
+    """
+    distance = np.asarray(distance)
+    angle = np.asarray(angle)
+    # If arrays are provided, treat the worst component as the error.
+    distance_v = float(distance.max()) if distance.ndim else float(distance)
+    angle_v = float(angle.max()) if angle.ndim else float(angle)
+    return distance_v <= DISTANCE_ERROR and angle_v <= ANGLE_ERROR
+
+
+def difference_distance(a, b) -> float:
+    """
+    Get the difference between two positions.
+    :param a: First position.
+    :param b: Second position.
+    :return: The differences between the two positions.
+    """
+    return np.sqrt(sum([(x - y) ** 2 for x, y in zip(a, b)]))
+
+
+def difference_angle(a: float | int = 0, b: float | int = 0) -> float:
+    """
+    Get the difference between two angles.
+    :param a: First angle.
+    :param b: Second angle.
+    :return: The differences between the two angle.
+    """
+    return sum([abs(x - y) for x, y in zip(a, b)])
+
+def get_quaternion_angle_difference(q1, q2):
+    """
+    Calculates the angular difference (in degrees) between two unit quaternions.
+    Assumes q1 and q2 are NumPy arrays of shape (4,) or (N, 4) for batch processing.
+    :param q1: The first quaternion.
+    :param q2: The second quaternion.
+    :return: The angle difference.
+    """
+    # Calculate the dot product.
+    dot_product = np.dot(q1, q2)
+    # Handle batch processing (N, 4) dot (N, 4).
+    if q1.ndim == 2:
+        dot_product = np.sum(q1 * q2, axis=1)
+    # Take the absolute value to get the shortest path.
+    dot_product = np.abs(dot_product)
+    # Clip the value to be in [-1.0, 1.0] to prevent acos from failing due to floating point inaccuracies.
+    dot_product = np.clip(dot_product, -1.0, 1.0)
+    # Calculate the angle in radians which is the half-angle.
+    half_angle = np.arccos(dot_product)
+    # Double it to get the full angle.
+    angle_rad = 2 * half_angle
+    # Convert to degrees.
+    return np.degrees(angle_rad)
+
+
+def quaternion_from_matrix(matrix):
+    """
+    Get a quaternion from a matrix.
+    :param matrix: The matrix.
+    :return: The quaternion.
+    """
+    M = np.array(matrix, dtype=np.float64, copy=False)[:4, :4]
+    m00 = M[0, 0]
+    m01 = M[0, 1]
+    m02 = M[0, 2]
+    m10 = M[1, 0]
+    m11 = M[1, 1]
+    m12 = M[1, 2]
+    m20 = M[2, 0]
+    m21 = M[2, 1]
+    m22 = M[2, 2]
+    # Symmetric matrix K.
+    K = np.array([[m00 - m11 - m22, 0.0, 0.0, 0.0],
+                  [m01 + m10, m11 - m00 - m22, 0.0, 0.0],
+                  [m02 + m20, m12 + m21, m22 - m00 - m11, 0.0],
+                  [m21 - m12, m02 - m20, m10 - m01, m00 + m11 + m22]])
+    K /= 3.0
+    # Quaternion is eigenvector of K that corresponds to the largest eigenvalue.
+    w, V = np.linalg.eigh(K)
+    q = V[[3, 0, 1, 2], np.argmax(w)]
+    if q[0] < 0.0:
+        np.negative(q, q)
+    return q
+
+
+def common_caching(elapsed: float, distance: float, angle: float, title: str) -> None:
+    """
+    Common solver caching operations.
+    :param elapsed: The elapsed execution time.
+    :param distance: The positional error.
+    :param angle: The orientation error.
+    :param title: Where to cache it.
+    :return: If it was a success, the elapsed execution time, and the distance and angle offsets.
+    """
+    if reached(distance, angle):
+        cache[title]["Success"] += 1
+    else:
+        cache[title]["Distance"] += distance
+        cache[title]["Angle"] += angle
+    cache[title]["Elapsed"] += elapsed
+
+
+def ikpy_common(case: list[float]) -> tuple[list[float], list[float]]:
+    """
+    Apply clamping for the IKPy-based solvers.
+    :param case: The joints to test for this case.
+    :return: The target position and orientation to solve for.
+    """
+    positions, orientations = robot_llm_ik.forward_kinematics(0, 5, case)
+    return positions[-1], orientations[-1]
+
+
+def bench_ikpy(case: list[float]) -> None:
+    """Benchmark built-in IKPy."""
+    target_position, target_orientation = ikpy_common(case)
+    _, distance, angle, elapsed = robot_llm_ik.inverse_kinematics(0, 5, target_position, target_orientation)
+    common_caching(elapsed, distance, angle, "IKPy")
+
+
+def bench_ikfast(case: list[float]) -> None:
+    """Benchmark the IKFast solver."""
+    t = robot_ikfast.forward(case)
+    zeros = [0] * len(case)
+    start_time = time.perf_counter()
+    solution = robot_ikfast.inverse(t, False, zeros)
+    elapsed = time.perf_counter() - start_time
+    if solution is None:
+        r = robot_ikfast.forward(zeros)
+    else:
+        r = robot_ikfast.forward(solution)
+    distance = difference_distance([t[0], t[1], t[2]], [r[0], r[1], r[2]])
+    angle = get_quaternion_angle_difference(
+        np.array([t[3], t[4], t[5], t[6]], dtype="float64"),
+        np.array([r[3], r[4], r[5], r[6]], dtype="float64"),
+    )
+    common_caching(elapsed, distance, angle, "IKFast")
+
+
+def bench_trac_ik(case: list[float]) -> None:
+    """Benchmark the Trac-IK solver."""
+    lb, ub = robot_trac_ik.joint_limits
+    clamped = []
+    for index in range(len(case)):
+        clamped.append(min(ub[index], max(case[index], lb[index])))
+    t_p, t_r = robot_trac_ik.fk(np.array(clamped))
+    zeros = np.zeros(len(case), dtype=float)
+    start_time = time.perf_counter()
+    solution = robot_trac_ik.ik(t_p, t_r, zeros)
+    elapsed = time.perf_counter() - start_time
+    if solution is None:
+        r_p, r_r = robot_trac_ik.fk(zeros)
+    else:
+        r_p, r_r = robot_trac_ik.fk(solution)
+    distance = difference_distance(t_p, r_p)
+    angle = get_quaternion_angle_difference(quaternion_from_matrix(t_r), quaternion_from_matrix(r_r))
+    common_caching(elapsed, distance, angle, "TRAC-IK")
 
 
 def _rotation_angle_deg(R_target: np.ndarray, R_result: np.ndarray) -> float:
-    """Return the geodesic angle between two rotation matrices in degrees.
-
-    Uses a quaternion-based formula for numerical stability.
-    """
-
-    def _quat_from_R(R: np.ndarray) -> np.ndarray:
-        # Robust conversion using the (trace+1) branch; clip to avoid negative due to drift.
-        tr = float(np.trace(R))
-        w2 = max(0.0, (tr + 1.0) * 0.25)
-        w = float(np.sqrt(w2))
-        if w < 1e-9:
-            # Fallback: use diagonal-based selection (rare for ~180deg)
-            i = int(np.argmax(np.diag(R)))
-            if i == 0:
-                x = np.sqrt(max(0.0, (1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 0.25))
-                y = (R[0, 1] + R[1, 0]) / (4.0 * x + 1e-12)
-                z = (R[0, 2] + R[2, 0]) / (4.0 * x + 1e-12)
-                w = (R[2, 1] - R[1, 2]) / (4.0 * x + 1e-12)
-                q = np.array([w, x, y, z], dtype=np.float64)
-            elif i == 1:
-                y = np.sqrt(max(0.0, (1.0 - R[0, 0] + R[1, 1] - R[2, 2]) * 0.25))
-                x = (R[0, 1] + R[1, 0]) / (4.0 * y + 1e-12)
-                z = (R[1, 2] + R[2, 1]) / (4.0 * y + 1e-12)
-                w = (R[0, 2] - R[2, 0]) / (4.0 * y + 1e-12)
-                q = np.array([w, x, y, z], dtype=np.float64)
-            else:
-                z = np.sqrt(max(0.0, (1.0 - R[0, 0] - R[1, 1] + R[2, 2]) * 0.25))
-                x = (R[0, 2] + R[2, 0]) / (4.0 * z + 1e-12)
-                y = (R[1, 2] + R[2, 1]) / (4.0 * z + 1e-12)
-                w = (R[1, 0] - R[0, 1]) / (4.0 * z + 1e-12)
-                q = np.array([w, x, y, z], dtype=np.float64)
-        else:
-            x = (R[2, 1] - R[1, 2]) / (4.0 * w + 1e-12)
-            y = (R[0, 2] - R[2, 0]) / (4.0 * w + 1e-12)
-            z = (R[1, 0] - R[0, 1]) / (4.0 * w + 1e-12)
-            q = np.array([w, x, y, z], dtype=np.float64)
-
-        q /= (np.linalg.norm(q) + 1e-12)
-        return q
-
+    """Geodesic angle between two rotation matrices in degrees."""
     Rt = np.asarray(R_target[:3, :3], dtype=np.float64)
     Rr = np.asarray(R_result[:3, :3], dtype=np.float64)
-
-    # Relative rotation
     R_rel = Rt.T @ Rr
-    q = _quat_from_R(R_rel)
-
-    # For unit quaternion, angle = 2*acos(|w|)
-    w = float(np.clip(abs(q[0]), 0.0, 1.0))
-    ang = float(np.degrees(2.0 * np.arccos(w)))
-    if not np.isfinite(ang):
-        return float("inf")
-    return ang
+    tr = float(np.trace(R_rel))
+    # Clamp for numerical stability.
+    c = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    return float(np.degrees(np.arccos(c)))
 
 
-def _fk_tip_pose(solver: InverseKinematicsSolver, angles: np.ndarray, tip_bone: str):
-    fk = solver.fk_solver.compute_fk_from_angles(angles)
-    idx = solver.fk_solver.bone_names.index(tip_bone)
+def _infer_tip_bone(jax_solver: InverseKinematicsSolver) -> str:
+    for c in ("tool0", "ee_link", "end_effector", "wrist_3_link"):
+        if c in jax_solver.fk_solver.bone_names:
+            return c
+    return jax_solver.fk_solver.bone_names[-1]
+
+
+def _fk_tip_pose(jax_solver: InverseKinematicsSolver, angles: np.ndarray, tip_bone: str):
+    fk = jax_solver.fk_solver.compute_fk_from_angles(angles)
+    idx = jax_solver.fk_solver.bone_names.index(tip_bone)
     T = np.asarray(fk[idx])
     pos = np.asarray(T[:3, 3])
     return pos, T
 
 
-def _infer_tip_bone(solver: InverseKinematicsSolver) -> str:
-    # Prefer common UR end-effector link names if present.
-    candidates = [
-        "tool0",
-        "ee_link",
-        "end_effector",
-        "wrist_3_link",
-    ]
-    for c in candidates:
-        if c in solver.fk_solver.bone_names:
-            return c
-
-    # Fallback: choose any leaf bone (no children) and pick the last one for stability.
-    leaves = [
-        name
-        for name in solver.fk_solver.bone_names
-        if not solver.fk_solver.skeleton.get(name, {}).get("children")
-    ]
-    if leaves:
-        return leaves[-1]
-
-    return solver.fk_solver.bone_names[-1]
+def _clamp(x: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    return np.minimum(hi, np.maximum(lo, x))
 
 
-def _ikpy_fk(chain, q_active: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return (pos, T) using IKPy's FK for a vector of active joint angles."""
-    if chain is None:
-        return None
-
-    q_active = np.asarray(q_active, dtype=np.float64).reshape(-1)
-
-    # IKPy uses one value per link; fixed links still occupy a slot.
-    q_full = np.zeros(len(chain.links), dtype=np.float64)
-    j = 0
-    for i, link in enumerate(chain.links):
-        if getattr(link, "joint_type", None) != "fixed":
-            if j < q_active.size:
-                q_full[i] = float(q_active[j])
-            j += 1
-
-    T = np.asarray(chain.forward_kinematics(q_full), dtype=np.float64)
-    pos = np.asarray(T[:3, 3], dtype=np.float64)
-    return pos, T
+def _jax_bounds_arrays(solver: InverseKinematicsSolver) -> tuple[np.ndarray, np.ndarray]:
+    """Return (lower, upper) arrays for JAX-IK Euler representation."""
+    lo = np.asarray(solver.lower_bounds, dtype=np.float32)
+    hi = np.asarray(solver.upper_bounds, dtype=np.float32)
+    if lo.shape != hi.shape:
+        raise RuntimeError(f"JAX bounds shape mismatch: {lo.shape} vs {hi.shape}")
+    return lo, hi
 
 
-def _ikfast_fk(kin, q: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return (pos, T) using IKFast's forward() output."""
-    if kin is None:
-        return None
-    q = np.asarray(q, dtype=np.float64).reshape(-1)
-    t = np.asarray(kin.forward(q.tolist()), dtype=np.float64).reshape(-1)
+def _jax_embed_canonical_6dof(q6: np.ndarray, *, bones: list[str]) -> np.ndarray:
+    """Embed a 6-DOF joint vector into JAX-IK's 3-per-bone Euler representation.
 
-    # IKFast pose is [x,y,z,qx,qy,qz,qw]
-    pos = t[:3]
-    qx, qy, qz, qw = t[3], t[4], t[5], t[6]
+    JAX-IK represents each controlled bone as 3 Euler values. For UR5's revolute joints,
+    we put the 1-DOF revolute angle into a single component and keep the other two at 0.
 
-    # quaternion -> rotation matrix
-    x, y, z, w = qx, qy, qz, qw
-    n = x * x + y * y + z * z + w * w
-    if n < 1e-16:
-        R = np.eye(3, dtype=np.float64)
-    else:
-        s = 2.0 / n
-        xx, yy, zz = x * x * s, y * y * s, z * z * s
-        xy, xz, yz = x * y * s, x * z * s, y * z * s
-        wx, wy, wz = w * x * s, w * y * s, w * z * s
-        R = np.array(
-            [
-                [1.0 - (yy + zz), xy - wz, xz + wy],
-                [xy + wz, 1.0 - (xx + zz), yz - wx],
-                [xz - wy, yz + wx, 1.0 - (xx + yy)],
-            ],
-            dtype=np.float64,
-        )
+    Assumption (consistent with many URDF->Euler pipelines): the revolute axis corresponds
+    to the local Z rotation component.
 
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = pos
-    return pos, T
+    If your URDF/JAX-IK config uses a different axis convention, this is the only place
+    you'll need to adjust.
+    """
+    q6 = np.asarray(q6, dtype=np.float32).reshape(-1)
+    if q6.shape[0] != 6:
+        raise ValueError(f"Expected q6 shape (6,), got {q6.shape}")
+    if len(bones) != 6:
+        raise ValueError(f"Expected 6 controlled bones for UR5, got {len(bones)}: {bones}")
+
+    out = np.zeros((len(bones) * 3,), dtype=np.float32)
+    for i in range(6):
+        out[i * 3 + 2] = float(q6[i])
+    return out
 
 
-def _tracik_fk(tracik_solver, q: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    if tracik_solver is None:
-        return None
-    q = np.asarray(q, dtype=np.float64).reshape(-1)
-    pos, T = tracik_solver.fk(q)
-    pos = np.asarray(pos, dtype=np.float64).reshape(3)
-    T = np.asarray(T, dtype=np.float64)
-    return pos, T
+def _jax_init_from_canonical(q6: np.ndarray, solver: InverseKinematicsSolver) -> np.ndarray:
+    """Convert canonical 6-DOF joints to a JAX-IK Euler init and clamp to JAX limits."""
+    q_euler = _jax_embed_canonical_6dof(q6, bones=solver.controlled_bones)
+    lo, hi = _jax_bounds_arrays(solver)
+
+    return _clamp(q_euler, lo, hi)
 
 
-def _build_bounds_for_controlled_bones(
-    solver: InverseKinematicsSolver,
-) -> list[tuple[float, float]]:
-    """Return radian bounds for the solver angle vector (already expanded to 3 per bone)."""
-    return list(zip(np.asarray(solver.lower_bounds), np.asarray(solver.upper_bounds)))
+# JAX-IK solver setup.
+_tmp = InverseKinematicsSolver(
+    model_file="models/UR5.urdf",
+    controlled_bones=[],
+    bounds=[(-180, 180)] * 6 * 3,
+    threshold=DISTANCE_ERROR,
+    num_steps=1000,
+    compute_sdf=False,
+)
+_movable = [b for b in _tmp.fk_solver.limits.keys() if b in _tmp.fk_solver.bone_names]
+_preferred = [
+    "shoulder_link",
+    "upper_arm_link",
+    "forearm_link",
+    "wrist_1_link",
+    "wrist_2_link",
+    "wrist_3_link",
+]
+if all(p in _movable for p in _preferred):
+    _movable = _preferred
+
+jax_solver = InverseKinematicsSolver(
+    model_file="models/UR5.urdf",
+    controlled_bones=_movable,
+    bounds=None,
+    threshold=DISTANCE_ERROR,
+    num_steps=1000,
+    compute_sdf=False,
+)
+
+jax_tip_bone = _infer_tip_bone(jax_solver)
+
+# JAX-IK bounds are in radians per-euler component (len == 3 * bones).
+jax_bounds = list(zip(np.asarray(jax_solver.lower_bounds), np.asarray(jax_solver.upper_bounds)))
 
 
-def _pose_T_from_pos_R(target_pos: np.ndarray, R: np.ndarray) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.asarray(R[:3, :3], dtype=np.float64)
-    T[:3, 3] = np.asarray(target_pos[:3], dtype=np.float64)
-    return T
+def bench_jax_ik(q6_canon: np.ndarray) -> None:
+    """Benchmark JAX-IK using the same canonical seed as other solvers.
 
+    Canonical seed is 6-DOF revolute joints; JAX-IK uses Euler angles internally.
+    We convert + clamp for JAX-IK only.
+    """
+    init = _jax_init_from_canonical(q6_canon, jax_solver)
 
-def _ikpy_solve(
-    urdf_path: str,
-    active_joint_count: int,
-    target_pos: np.ndarray,
-    target_T: np.ndarray,
-    seed_q: np.ndarray,
-) -> np.ndarray | None:
-    if ikpy is None:
-        return None
+    # Target generated deterministically from the same canonical joints (mapped to JAX space).
+    target_pos, target_T = _fk_tip_pose(jax_solver, init, jax_tip_bone)
 
-    chain = ikpy.chain.Chain.from_urdf_file(urdf_path)
-    # IKPy expects a full joint vector including fixed joints; simplest is to provide an initial guess of zeros.
-    q0 = np.zeros(len(chain.links), dtype=np.float64)
-    # Map our active joints into the chain's active joints order: IKPy uses one angle per link.
-    # We assume revolute joints correspond sequentially and ignore fixed links; this matches typical URDFs.
-    # Seed is used for stability if sizes match.
-    if seed_q is not None:
-        j = 0
-        for i, link in enumerate(chain.links):
-            if getattr(link, "joint_type", None) != "fixed":
-                if j < len(seed_q):
-                    q0[i] = float(seed_q[j])
-                j += 1
-
-    target_frame = np.asarray(target_T, dtype=np.float64)
-    # Newer IKPy versions support full 4x4 targets via `target_matrix`.
-    try:
-        sol = chain.inverse_kinematics(target_matrix=target_frame, initial_position=q0)
-    except TypeError:
-        # Fallback: position-only IK.
-        sol = chain.inverse_kinematics(target_pos, initial_position=q0)
-
-    # Extract the first N active joints.
-    out = []
-    for i, link in enumerate(chain.links):
-        if getattr(link, "joint_type", None) != "fixed":
-            out.append(float(sol[i]))
-            if len(out) >= active_joint_count:
-                break
-    if len(out) != active_joint_count:
-        return None
-    return np.asarray(out, dtype=np.float32)
-
-
-def _ikfast_solve(
-    robot_name: str,
-    target_pos: np.ndarray,
-    target_T: np.ndarray,
-    seed_q: np.ndarray,
-) -> np.ndarray | None:
-    if ur_kinematics is None:
-        return None
-    if robot_name.lower() not in {"ur5", "ur5e", "ur3", "ur10", "ur10e", "ur3e"}:
-        return None
-
-    kin = ur_kinematics.URKinematics(robot_name.lower())
-    # IKFast wrapper typically uses a 7D pose: [x,y,z,qx,qy,qz,qw]
-    # Compute quaternion from rotation matrix.
-    R = np.asarray(target_T[:3, :3], dtype=np.float64)
-    # Robust quaternion from rotation matrix.
-    tr = float(np.trace(R))
-    qw = np.sqrt(max(0.0, 1.0 + tr)) / 2.0
-    qx = (R[2, 1] - R[1, 2]) / (4.0 * qw + 1e-12)
-    qy = (R[0, 2] - R[2, 0]) / (4.0 * qw + 1e-12)
-    qz = (R[1, 0] - R[0, 1]) / (4.0 * qw + 1e-12)
-
-    t = np.array(
-        [
-            float(target_pos[0]),
-            float(target_pos[1]),
-            float(target_pos[2]),
-            float(qx),
-            float(qy),
-            float(qz),
-            float(qw),
-        ],
-        dtype=np.float64,
+    mand = (
+        DistanceObjTraj(
+            bone_name=jax_tip_bone,
+            target_points=np.asarray(target_pos, dtype=np.float32),
+            use_head=True,
+            weight=1.0,
+        ),
+        EndEffectorOrientationObj(
+            bone_name=jax_tip_bone,
+            target_transform=np.asarray(target_T, dtype=np.float32),
+            weight=1.0,
+        ),
     )
 
-    zeros = np.zeros(6, dtype=np.float64)
     start = time.perf_counter()
-    sol = kin.inverse(t, False, zeros)
-    _ = time.perf_counter() - start
-
-    if sol is None:
-        return None
-    return np.asarray(sol, dtype=np.float32)
-
-
-def _tracik_solve(
-    urdf_path: str,
-    base_link_name: str,
-    tip_link_name: str,
-    target_pos: np.ndarray,
-    target_T: np.ndarray,
-    seed_q: np.ndarray,
-) -> np.ndarray | None:
-    if TracIK is None:
-        return None
-    solver = TracIK(
-        urdf_path=urdf_path,
-        base_link_name=base_link_name,
-        tip_link_name=tip_link_name,
+    solved_traj, _, _ = jax_solver.solve(
+        initial_rotations=init,
+        learning_rate=1e-3,
+        mandatory_objective_functions=mand,
+        optional_objective_functions=(),
+        ik_points=1,
+        patience=50,
+        verbose=False,
     )
-    # TracIK expects position and rotation matrix.
-    t_p = np.asarray(target_pos, dtype=np.float64)
-    t_r = np.asarray(target_T[:3, :3], dtype=np.float64)
-    q0 = np.asarray(seed_q[: len(solver.joint_limits[0])], dtype=np.float64)
-    sol = solver.ik(t_p, t_r, q0)
-    if sol is None:
-        return None
-    return np.asarray(sol, dtype=np.float32)
+    elapsed = time.perf_counter() - start
 
+    solved = np.asarray(solved_traj[-1], dtype=np.float32)
+    result_pos, result_T = _fk_tip_pose(jax_solver, solved, jax_tip_bone)
 
-def _repo_root() -> Path:
-    """Best-effort repository root (directory containing pyproject.toml).
+    dist = float(np.linalg.norm(result_pos - target_pos))
+    ang = _rotation_angle_deg(target_T, result_T)
 
-    This keeps CLI defaults and CI stable even if the script is invoked from a
-    different working directory.
-    """
-
-    cur = Path(__file__).resolve()
-    for p in (cur.parent, *cur.parents):
-        if (p / "pyproject.toml").is_file():
-            return p
-    # Fallback: assume repo root is one level above this file.
-    return cur.parent.parent
-
-
-def _resolve_urdf_path(urdf_arg: str) -> Path:
-    """Resolve a URDF path robustly.
-
-    Resolution order for relative paths:
-      1) current working directory
-      2) repo root (pyproject.toml)
-      3) directory containing this script
-    """
-
-    raw = Path(urdf_arg).expanduser()
-    if raw.is_absolute():
-        return raw
-
-    candidates = [
-        (Path.cwd() / raw),
-        (_repo_root() / raw),
-        (Path(__file__).resolve().parent / raw),
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
-
-    # Special-case: allow passing just a robot stem like "UR5".
-    stem = raw.as_posix()
-    stem = stem[:-5] if stem.lower().endswith(".urdf") else stem
-    candidates += [
-        (_repo_root() / "models" / f"{stem}.urdf"),
-        (_repo_root() / "models" / f"{stem.upper()}.urdf"),
-        (_repo_root() / "models" / f"{stem.lower()}.urdf"),
-    ]
-    for c in candidates[-3:]:
-        if c.is_file():
-            return c
-
-    msg = "URDF path not found. Tried:\n" + "\n".join(f"- {c}" for c in candidates)
-    raise ValueError(msg)
-
-
-def _as_fk_angle_vector(
-    solver: InverseKinematicsSolver,
-    q: np.ndarray,
-) -> np.ndarray:
-    """Coerce an input vector into the FK solver's expected angle vector shape.
-
-    JAX-IK's FK expects a flat vector of Euler XYZ angles for each controlled bone:
-        shape == (3 * len(controlled_bones),)
-
-    Some baseline IK solvers (IKPy / IKFast / TRAC-IK) return one value per joint
-    (typically 6 for UR robots). For evaluation, we expand that (N,) vector into
-    per-bone Euler angles by mapping each scalar to a Z-rotation: [0, 0, q_i].
-
-    This doesn't change JAX-IK itself; it only prevents the evaluation harness
-    from crashing when it tries to run FK on baseline solutions.
-    """
-
-    q = np.asarray(q, dtype=np.float32).reshape(-1)
-
-    expected = int(len(solver.fk_solver.controlled_indices) * 3)
-    if q.size == expected:
-        return q
-
-    # Baseline solvers often return one angle per joint (1-DOF each).
-    if expected % 3 == 0 and q.size == expected // 3:
-        out = np.zeros((q.size, 3), dtype=np.float32)
-        out[:, 2] = q
-        return out.reshape(-1)
-
-    raise ValueError(
-        f"Unexpected joint vector size for FK: got {q.size}, expected {expected} "
-        f"(or {expected//3} for 1-DOF baselines)."
-    )
-
-
-def run(
-    tests: int,
-    seed: int,
-    urdf_path: str,
-    tip_bone: str | None,
-    threshold: float,
-    num_steps: int,
-    learning_rate: float,
-    patience: int,
-    distance_error: float,
-    angle_error_deg: float,
-    warmup: int,
-    output_csv: str,
-    compute_sdf: bool,
-    orientation_weight: float,
-    restarts: int,
-    lr_decay: float,
-    methods: list[str],
-    robot_name: str,
-    tracik_base_link: str,
-    tracik_tip_link: str | None,
-) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-
-    urdf_p = _resolve_urdf_path(urdf_path)
-    urdf_path = str(urdf_p.resolve())
-
-    # Pre-build baseline solver instances/chains so we can compute FK consistently.
-    ikpy_chain = None
-    if "ikpy" in methods and ikpy is not None:
-        ikpy_chain = ikpy.chain.Chain.from_urdf_file(urdf_path)
-
-    ikfast_kin = None
-    if "ikfast" in methods and ur_kinematics is not None:
-        try:
-            ikfast_kin = ur_kinematics.URKinematics(robot_name.lower())
-        except Exception:
-            ikfast_kin = None
-
-    tracik_solver = None
-    if "trac-ik" in methods and TracIK is not None:
-        tracik_solver = TracIK(
-            urdf_path=urdf_path,
-            base_link_name=tracik_base_link,
-            tip_link_name=tracik_tip_link or "tool0",
-        )
-
-    # Build solver. If we don't specify controlled bones, there are none.
-    # For UR5 we want all movable links (those that have limits) as controlled.
-    tmp_solver = InverseKinematicsSolver(
-        model_file=urdf_path,
-        controlled_bones=[],
-        bounds=[(-180, 180)] * 6 * 3,
-        threshold=threshold,
-        num_steps=num_steps,
-        compute_sdf=compute_sdf,
-    )
-    movable = [
-        b
-        for b in tmp_solver.fk_solver.limits.keys()
-        if b in tmp_solver.fk_solver.bone_names
-    ]
-
-    # Many URDFs expose limits for extra fixed/virtual links (e.g. base/tool/ee).
-    # Baseline IK solvers (IKPy/IKFast/TRAC-IK) typically return only the actuated
-    # revolute joints (e.g. 6 for UR5). To keep evaluation consistent across
-    # solvers, default to the standard arm joint links when available.
-    preferred = [
-        "shoulder_link",
-        "upper_arm_link",
-        "forearm_link",
-        "wrist_1_link",
-        "wrist_2_link",
-        "wrist_3_link",
-    ]
-    if all(p in movable for p in preferred):
-        movable = preferred
-
-    solver = InverseKinematicsSolver(
-        model_file=urdf_path,
-        controlled_bones=movable,
-        bounds=None,
-        threshold=threshold,
-        num_steps=num_steps,
-        compute_sdf=compute_sdf,
-    )
-
-    if tip_bone is None:
-        tip_bone = _infer_tip_bone(solver)
-
-    if tracik_tip_link is None:
-        tracik_tip_link = tip_bone
-
-    bounds_rad = _build_bounds_for_controlled_bones(solver)
-
-    # Warmup (JAX compilation) excluded from stats
-    if warmup > 0 and "jax-ik" in methods:
-        q0 = np.array([(lo + hi) / 2.0 for lo, hi in bounds_rad], dtype=np.float32)
-        target_pos, target_T = _fk_tip_pose(solver, q0, tip_bone)
-        mand = (
-            DistanceObjTraj(
-                bone_name=tip_bone,
-                target_points=np.asarray(target_pos, dtype=np.float32),
-                use_head=True,
-                weight=1.0,
-            ),
-            EndEffectorOrientationObj(
-                bone_name=tip_bone,
-                target_transform=target_T,
-                weight=orientation_weight,
-            ),
-        )
-        for _ in range(warmup):
-            solver.solve(
-                initial_rotations=q0,
-                learning_rate=learning_rate,
-                mandatory_objective_functions=mand,
-                optional_objective_functions=(),
-                ik_points=1,
-                patience=patience,
-                verbose=False,
-            )
-
-    stats_by = {m: Stats() for m in methods}
-
-    active_joint_count = int(len(solver.fk_solver.controlled_indices))
-
-    for _ in range(tests):
-        # Random target in bounds.
-        q = np.array(
-            [random.uniform(lo, hi) for lo, hi in bounds_rad], dtype=np.float32
-        )
-
-        target_pos, target_T = _fk_tip_pose(solver, q, tip_bone)
-
-        mand = (
-            DistanceObjTraj(
-                bone_name=tip_bone,
-                target_points=np.asarray(target_pos, dtype=np.float32),
-                use_head=True,
-                weight=1.0,
-            ),
-            EndEffectorOrientationObj(
-                bone_name=tip_bone,
-                target_transform=target_T,
-                weight=orientation_weight,
-            ),
-        )
-
-        # JAX-IK (multi-start)
-        if "jax-ik" in methods:
-            best_elapsed = 0.0
-            best_dist = float("inf")
-            best_ang = float("inf")
-            for r in range(max(1, restarts)):
-                init = q if r == 0 else np.array(
-                    [random.uniform(lo, hi) for lo, hi in bounds_rad], dtype=np.float32
-                )
-                lr = float(learning_rate) * (float(lr_decay) ** r)
-                start = time.perf_counter()
-                solved_traj, _, _ = solver.solve(
-                    initial_rotations=init,
-                    learning_rate=lr,
-                    mandatory_objective_functions=mand,
-                    optional_objective_functions=(),
-                    ik_points=1,
-                    patience=patience,
-                    verbose=False,
-                )
-                elapsed = time.perf_counter() - start
-                solved = np.asarray(solved_traj[-1], dtype=np.float32)
-                result_pos, result_T = _fk_tip_pose(solver, solved, tip_bone)
-                dist = float(np.linalg.norm(result_pos - target_pos))
-                ang = _rotation_angle_deg(target_T, result_T)
-
-                score = dist + np.deg2rad(ang)
-                best_score = best_dist + np.deg2rad(best_ang)
-                if score < best_score:
-                    best_dist, best_ang, best_elapsed = dist, ang, elapsed
-                if best_dist <= distance_error and best_ang <= angle_error_deg:
-                    break
-
-            s = stats_by["jax-ik"]
-            s.elapsed += best_elapsed
-            if best_dist <= distance_error and best_ang <= angle_error_deg:
-                s.success += 1
-            else:
-                s.failure_distance_sum += best_dist
-                s.failure_angle_sum_deg += best_ang
-
-        # IKPy
-        if "ikpy" in methods:
-            start = time.perf_counter()
-            sol = _ikpy_solve(urdf_path, active_joint_count, target_pos, target_T, q)
-            elapsed = time.perf_counter() - start
-            if sol is None or ikpy_chain is None:
-                dist, ang = float("inf"), float("inf")
-            else:
-                fk_res = _ikpy_fk(ikpy_chain, sol)
-                if fk_res is None:
-                    dist, ang = float("inf"), float("inf")
-                else:
-                    result_pos, result_T = fk_res
-                    dist = float(np.linalg.norm(result_pos - target_pos))
-                    ang = _rotation_angle_deg(target_T, result_T)
-            s = stats_by["ikpy"]
-            s.elapsed += elapsed
-            if dist <= distance_error and ang <= angle_error_deg:
-                s.success += 1
-            else:
-                s.failure_distance_sum += dist
-                s.failure_angle_sum_deg += ang
-
-        # IKFast
-        if "ikfast" in methods:
-            start = time.perf_counter()
-            sol = _ikfast_solve(robot_name, target_pos, target_T, q)
-            elapsed = time.perf_counter() - start
-            if sol is None or ikfast_kin is None:
-                dist, ang = float("inf"), float("inf")
-            else:
-                fk_res = _ikfast_fk(ikfast_kin, sol)
-                if fk_res is None:
-                    dist, ang = float("inf"), float("inf")
-                else:
-                    result_pos, result_T = fk_res
-                    dist = float(np.linalg.norm(result_pos - target_pos))
-                    ang = _rotation_angle_deg(target_T, result_T)
-            s = stats_by["ikfast"]
-            s.elapsed += elapsed
-            if dist <= distance_error and ang <= angle_error_deg:
-                s.success += 1
-            else:
-                s.failure_distance_sum += dist
-                s.failure_angle_sum_deg += ang
-
-        # TRAC-IK
-        if "trac-ik" in methods:
-            start = time.perf_counter()
-            sol = _tracik_solve(
-                urdf_path,
-                tracik_base_link,
-                tracik_tip_link,
-                target_pos,
-                target_T,
-                q,
-            )
-            elapsed = time.perf_counter() - start
-            if sol is None or tracik_solver is None:
-                dist, ang = float("inf"), float("inf")
-            else:
-                fk_res = _tracik_fk(tracik_solver, sol)
-                if fk_res is None:
-                    dist, ang = float("inf"), float("inf")
-                else:
-                    result_pos, result_T = fk_res
-                    dist = float(np.linalg.norm(result_pos - target_pos))
-                    ang = _rotation_angle_deg(target_T, result_T)
-            s = stats_by["trac-ik"]
-            s.elapsed += elapsed
-            if dist <= distance_error and ang <= angle_error_deg:
-                s.success += 1
-            else:
-                s.failure_distance_sum += dist
-                s.failure_angle_sum_deg += ang
-
-    header = (
-        "Solver,Success Rate (%),Average Elapsed Time (s),Average Failure Distance (mm),Average Failure Angle (°)"
-    )
-
-    lines = [header]
-    for m in methods:
-        st = stats_by[m]
-        failures = tests - st.success
-        if failures > 0:
-            avg_fail_dist_mm = (st.failure_distance_sum / failures) * 1000.0
-            avg_fail_ang = st.failure_angle_sum_deg / failures
-            if not np.isfinite(avg_fail_dist_mm):
-                avg_fail_dist_mm = float("inf")
-            if not np.isfinite(avg_fail_ang):
-                avg_fail_ang = float("inf")
-            fail_dist_str = f"{avg_fail_dist_mm} mm"
-            fail_ang_str = f"{avg_fail_ang} °"
-        else:
-            fail_dist_str = "-"
-            fail_ang_str = "-"
-
-        line = (
-            f"{m},{st.success / tests * 100}%,{(st.elapsed / tests)*1000} ms,{fail_dist_str},{fail_ang_str}"
-        )
-        lines.append(line)
-
-    s = "\n".join(lines)
-    print(s)
-    with open(output_csv, "w", encoding="utf-8", errors="ignore") as f:
-        f.write(s)
+    common_caching(elapsed, dist, ang, "JAX-IK")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--tests", type=int, default=1000)
-    p.add_argument("--seed", type=int, default=123)
-    p.add_argument(
-        "--urdf",
-        type=str,
-        # Default to the repo's canonical UR5 URDF.
-        default=str(_repo_root() / "models" / "UR5.urdf"),
+    # Warmup JIT compilation
+    q0_6 = np.asarray([(lo + hi) / 2.0 for lo, hi in bounds_llm_ik], dtype=np.float32)
+    q0 = _jax_init_from_canonical(q0_6, jax_solver)
+    target_pos, target_T = _fk_tip_pose(jax_solver, q0, jax_tip_bone)
+    mand = (
+        DistanceObjTraj(
+            bone_name=jax_tip_bone,
+            target_points=np.asarray(target_pos, dtype=np.float32),
+            use_head=True,
+            weight=1.0,
+        ),
+        EndEffectorOrientationObj(
+            bone_name=jax_tip_bone,
+            target_transform=np.asarray(target_T, dtype=np.float32),
+            weight=1.0,
+        ),
     )
-    p.add_argument("--tip-bone", type=str, default=None)
-    p.add_argument("--threshold", type=float, default=0.01)
-    p.add_argument("--num-steps", type=int, default=1000)
-    p.add_argument("--learning-rate", type=float, default=0.0001)
-    p.add_argument("--patience", type=int, default=10)
-    p.add_argument("--distance-error", type=float, default=0.01)
-    p.add_argument("--angle-error-deg", type=float, default=1.0)
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--output-csv", type=str, default="Additional.csv")
-    p.add_argument(
-        "--compute-sdf", action=argparse.BooleanOptionalAction, default=False
-    )
-    p.add_argument("--orientation-weight", type=float, default=1.0)
-    p.add_argument(
-        "--restarts",
-        type=int,
-        default=1,
-        help="Number of random restarts per test case (higher = higher success, slower).",
-    )
-    p.add_argument(
-        "--lr-decay",
-        type=float,
-        default=0.6,
-        help="Multiplier applied to learning-rate for each successive restart.",
-    )
+    for _ in range(3):
+        jax_solver.solve(
+            initial_rotations=q0,
+            learning_rate=0.0001,
+            mandatory_objective_functions=mand,
+            optional_objective_functions=(),
+            ik_points=1,
+            patience=50,
+            verbose=False,
+        )
 
-    p.add_argument(
-        "--methods",
-        type=str,
-        default="jax-ik,ikpy,ikfast,trac-ik",
-        help="Comma-separated list of solvers to run: jax-ik,ikpy,ikfast,trac-ik",
-    )
-    p.add_argument(
-        "--robot-name",
-        type=str,
-        default="ur5",
-        help="Robot name for IKFast backend (e.g. ur5).",
-    )
-    p.add_argument(
-        "--tracik-base-link",
-        type=str,
-        default="base_link",
-        help="Base link name for TRAC-IK.",
-    )
-    p.add_argument(
-        "--tracik-tip-link",
-        type=str,
-        default=None,
-        help="Tip link name for TRAC-IK (defaults to --tip-bone).",
-    )
+    # Run all test cases.
+    for _ in range(TESTS):
+        # Sample one canonical 6-DOF joint vector (radians) and reuse it everywhere.
+        q6 = _sample_canonical_joints()
 
-    args = p.parse_args()
+        joints = q6.tolist()
+        bench_ikpy(joints)
+        bench_ikfast(joints)
+        bench_trac_ik(joints)
+        bench_jax_ik(q6)
 
-    methods = [m.strip().lower() for m in args.methods.split(",") if m.strip()]
-    # Normalize a couple common spellings.
-    methods = ["trac-ik" if m in {"tracik", "trac_ik", "trac-ik"} else m for m in methods]
-    methods = ["jax-ik" if m in {"jax", "jaxik", "jax-ik"} else m for m in methods]
+    # Tabulate data.
+    s = "Solver,Success Rate (%),Average Elapsed Time (s),Average Failure Distance,Average Failure Angle (°)"
+    sorted_cache = dict(sorted(cache.items(), key=lambda item: (-item[1]["Success"], item[1]["Elapsed"], item[0])))
+    for entry in sorted_cache:
+        failures = TESTS - sorted_cache[entry]["Success"]
+        if failures < 1:
+            d = "-"
+            a = "-"
+        else:
+            d = sorted_cache[entry]["Distance"] / failures
+            a = f"{sorted_cache[entry]['Angle'] / failures} °"
+        s += f"\n{entry},{sorted_cache[entry]['Success'] / TESTS * 100}%,{sorted_cache[entry]['Elapsed'] / TESTS} s,{d},{a}"
 
-    run(
-        tests=args.tests,
-        seed=args.seed,
-        urdf_path=args.urdf,
-        tip_bone=args.tip_bone,
-        threshold=args.threshold,
-        num_steps=args.num_steps,
-        learning_rate=args.learning_rate,
-        patience=args.patience,
-        distance_error=args.distance_error,
-        angle_error_deg=args.angle_error_deg,
-        warmup=args.warmup,
-        output_csv=args.output_csv,
-        compute_sdf=args.compute_sdf,
-        orientation_weight=args.orientation_weight,
-        restarts=args.restarts,
-        lr_decay=args.lr_decay,
-        methods=methods,
-        robot_name=args.robot_name,
-        tracik_base_link=args.tracik_base_link,
-        tracik_tip_link=args.tracik_tip_link,
-    )
+    print(s)
+    with open("Additional.csv", "w", encoding="utf-8", errors="ignore") as file:
+        file.write(s)
 
 
 if __name__ == "__main__":
     main()
-
