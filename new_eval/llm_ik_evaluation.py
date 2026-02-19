@@ -251,6 +251,59 @@ def _tracik_solve(
     return np.asarray(sol, dtype=np.float32)
 
 
+def _repo_root() -> Path:
+    """Best-effort repository root (directory containing pyproject.toml).
+
+    This keeps CLI defaults and CI stable even if the script is invoked from a
+    different working directory.
+    """
+
+    cur = Path(__file__).resolve()
+    for p in (cur.parent, *cur.parents):
+        if (p / "pyproject.toml").is_file():
+            return p
+    # Fallback: assume repo root is one level above this file.
+    return cur.parent.parent
+
+
+def _resolve_urdf_path(urdf_arg: str) -> Path:
+    """Resolve a URDF path robustly.
+
+    Resolution order for relative paths:
+      1) current working directory
+      2) repo root (pyproject.toml)
+      3) directory containing this script
+    """
+
+    raw = Path(urdf_arg).expanduser()
+    if raw.is_absolute():
+        return raw
+
+    candidates = [
+        (Path.cwd() / raw),
+        (_repo_root() / raw),
+        (Path(__file__).resolve().parent / raw),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+
+    # Special-case: allow passing just a robot stem like "UR5".
+    stem = raw.as_posix()
+    stem = stem[:-5] if stem.lower().endswith(".urdf") else stem
+    candidates += [
+        (_repo_root() / "models" / f"{stem}.urdf"),
+        (_repo_root() / "models" / f"{stem.upper()}.urdf"),
+        (_repo_root() / "models" / f"{stem.lower()}.urdf"),
+    ]
+    for c in candidates[-3:]:
+        if c.is_file():
+            return c
+
+    msg = "URDF path not found. Tried:\n" + "\n".join(f"- {c}" for c in candidates)
+    raise ValueError(msg)
+
+
 def run(
     tests: int,
     seed: int,
@@ -276,9 +329,7 @@ def run(
     random.seed(seed)
     np.random.seed(seed)
 
-    urdf_p = Path(urdf_path).expanduser()
-    if not urdf_p.is_absolute():
-        urdf_p = (Path(__file__).resolve().parent / urdf_p)
+    urdf_p = _resolve_urdf_path(urdf_path)
     urdf_path = str(urdf_p.resolve())
 
     # Build solver. If we don't specify controlled bones, there are none.
@@ -512,7 +563,8 @@ def main() -> None:
     p.add_argument(
         "--urdf",
         type=str,
-        default=str(Path(__file__).resolve().parent / "UR5.urdf"),
+        # Default to the repo's canonical UR5 URDF.
+        default=str(_repo_root() / "models" / "UR5.urdf"),
     )
     p.add_argument("--tip-bone", type=str, default=None)
     p.add_argument("--threshold", type=float, default=0.01)
