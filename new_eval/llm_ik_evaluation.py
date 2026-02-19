@@ -13,16 +13,19 @@ from jax_ik.objectives import DistanceObjTraj, EndEffectorOrientationObj
 try:
     import ikpy.chain  # type: ignore
 except Exception:  # pragma: no cover
+    print("Warning: IKPy not available. IKPy results will be skipped.")
     ikpy = None  # type: ignore
 
 try:
     from trac_ik import TracIK  # type: ignore
 except Exception:  # pragma: no cover
+    print("Warning: TRAC-IK not available. TRAC-IK results will be skipped.")
     TracIK = None  # type: ignore
 
 try:
     from ur_ikfast import ur_kinematics  # type: ignore
 except Exception:  # pragma: no cover
+    print("Warning: IKFast UR kinematics not available. IKFast results will be skipped.")
     ur_kinematics = None  # type: ignore
 
 
@@ -119,8 +122,74 @@ def _infer_tip_bone(solver: InverseKinematicsSolver) -> str:
     if leaves:
         return leaves[-1]
 
-    # Absolute fallback.
     return solver.fk_solver.bone_names[-1]
+
+
+def _ikpy_fk(chain, q_active: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return (pos, T) using IKPy's FK for a vector of active joint angles."""
+    if chain is None:
+        return None
+
+    q_active = np.asarray(q_active, dtype=np.float64).reshape(-1)
+
+    # IKPy uses one value per link; fixed links still occupy a slot.
+    q_full = np.zeros(len(chain.links), dtype=np.float64)
+    j = 0
+    for i, link in enumerate(chain.links):
+        if getattr(link, "joint_type", None) != "fixed":
+            if j < q_active.size:
+                q_full[i] = float(q_active[j])
+            j += 1
+
+    T = np.asarray(chain.forward_kinematics(q_full), dtype=np.float64)
+    pos = np.asarray(T[:3, 3], dtype=np.float64)
+    return pos, T
+
+
+def _ikfast_fk(kin, q: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return (pos, T) using IKFast's forward() output."""
+    if kin is None:
+        return None
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    t = np.asarray(kin.forward(q.tolist()), dtype=np.float64).reshape(-1)
+
+    # IKFast pose is [x,y,z,qx,qy,qz,qw]
+    pos = t[:3]
+    qx, qy, qz, qw = t[3], t[4], t[5], t[6]
+
+    # quaternion -> rotation matrix
+    x, y, z, w = qx, qy, qz, qw
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-16:
+        R = np.eye(3, dtype=np.float64)
+    else:
+        s = 2.0 / n
+        xx, yy, zz = x * x * s, y * y * s, z * z * s
+        xy, xz, yz = x * y * s, x * z * s, y * z * s
+        wx, wy, wz = w * x * s, w * y * s, w * z * s
+        R = np.array(
+            [
+                [1.0 - (yy + zz), xy - wz, xz + wy],
+                [xy + wz, 1.0 - (xx + zz), yz - wx],
+                [xz - wy, yz + wx, 1.0 - (xx + yy)],
+            ],
+            dtype=np.float64,
+        )
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = pos
+    return pos, T
+
+
+def _tracik_fk(tracik_solver, q: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if tracik_solver is None:
+        return None
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    pos, T = tracik_solver.fk(q)
+    pos = np.asarray(pos, dtype=np.float64).reshape(3)
+    T = np.asarray(T, dtype=np.float64)
+    return pos, T
 
 
 def _build_bounds_for_controlled_bones(
@@ -304,6 +373,41 @@ def _resolve_urdf_path(urdf_arg: str) -> Path:
     raise ValueError(msg)
 
 
+def _as_fk_angle_vector(
+    solver: InverseKinematicsSolver,
+    q: np.ndarray,
+) -> np.ndarray:
+    """Coerce an input vector into the FK solver's expected angle vector shape.
+
+    JAX-IK's FK expects a flat vector of Euler XYZ angles for each controlled bone:
+        shape == (3 * len(controlled_bones),)
+
+    Some baseline IK solvers (IKPy / IKFast / TRAC-IK) return one value per joint
+    (typically 6 for UR robots). For evaluation, we expand that (N,) vector into
+    per-bone Euler angles by mapping each scalar to a Z-rotation: [0, 0, q_i].
+
+    This doesn't change JAX-IK itself; it only prevents the evaluation harness
+    from crashing when it tries to run FK on baseline solutions.
+    """
+
+    q = np.asarray(q, dtype=np.float32).reshape(-1)
+
+    expected = int(len(solver.fk_solver.controlled_indices) * 3)
+    if q.size == expected:
+        return q
+
+    # Baseline solvers often return one angle per joint (1-DOF each).
+    if expected % 3 == 0 and q.size == expected // 3:
+        out = np.zeros((q.size, 3), dtype=np.float32)
+        out[:, 2] = q
+        return out.reshape(-1)
+
+    raise ValueError(
+        f"Unexpected joint vector size for FK: got {q.size}, expected {expected} "
+        f"(or {expected//3} for 1-DOF baselines)."
+    )
+
+
 def run(
     tests: int,
     seed: int,
@@ -332,6 +436,26 @@ def run(
     urdf_p = _resolve_urdf_path(urdf_path)
     urdf_path = str(urdf_p.resolve())
 
+    # Pre-build baseline solver instances/chains so we can compute FK consistently.
+    ikpy_chain = None
+    if "ikpy" in methods and ikpy is not None:
+        ikpy_chain = ikpy.chain.Chain.from_urdf_file(urdf_path)
+
+    ikfast_kin = None
+    if "ikfast" in methods and ur_kinematics is not None:
+        try:
+            ikfast_kin = ur_kinematics.URKinematics(robot_name.lower())
+        except Exception:
+            ikfast_kin = None
+
+    tracik_solver = None
+    if "trac-ik" in methods and TracIK is not None:
+        tracik_solver = TracIK(
+            urdf_path=urdf_path,
+            base_link_name=tracik_base_link,
+            tip_link_name=tracik_tip_link or "tool0",
+        )
+
     # Build solver. If we don't specify controlled bones, there are none.
     # For UR5 we want all movable links (those that have limits) as controlled.
     tmp_solver = InverseKinematicsSolver(
@@ -347,6 +471,21 @@ def run(
         for b in tmp_solver.fk_solver.limits.keys()
         if b in tmp_solver.fk_solver.bone_names
     ]
+
+    # Many URDFs expose limits for extra fixed/virtual links (e.g. base/tool/ee).
+    # Baseline IK solvers (IKPy/IKFast/TRAC-IK) typically return only the actuated
+    # revolute joints (e.g. 6 for UR5). To keep evaluation consistent across
+    # solvers, default to the standard arm joint links when available.
+    preferred = [
+        "shoulder_link",
+        "upper_arm_link",
+        "forearm_link",
+        "wrist_1_link",
+        "wrist_2_link",
+        "wrist_3_link",
+    ]
+    if all(p in movable for p in preferred):
+        movable = preferred
 
     solver = InverseKinematicsSolver(
         model_file=urdf_path,
@@ -395,7 +534,7 @@ def run(
 
     stats_by = {m: Stats() for m in methods}
 
-    active_joint_count = len(bounds_rad)
+    active_joint_count = int(len(solver.fk_solver.controlled_indices))
 
     for _ in range(tests):
         # Random target in bounds.
@@ -465,12 +604,16 @@ def run(
             start = time.perf_counter()
             sol = _ikpy_solve(urdf_path, active_joint_count, target_pos, target_T, q)
             elapsed = time.perf_counter() - start
-            if sol is None:
+            if sol is None or ikpy_chain is None:
                 dist, ang = float("inf"), float("inf")
             else:
-                result_pos, result_T = _fk_tip_pose(solver, sol, tip_bone)
-                dist = float(np.linalg.norm(result_pos - target_pos))
-                ang = _rotation_angle_deg(target_T, result_T)
+                fk_res = _ikpy_fk(ikpy_chain, sol)
+                if fk_res is None:
+                    dist, ang = float("inf"), float("inf")
+                else:
+                    result_pos, result_T = fk_res
+                    dist = float(np.linalg.norm(result_pos - target_pos))
+                    ang = _rotation_angle_deg(target_T, result_T)
             s = stats_by["ikpy"]
             s.elapsed += elapsed
             if dist <= distance_error and ang <= angle_error_deg:
@@ -484,12 +627,16 @@ def run(
             start = time.perf_counter()
             sol = _ikfast_solve(robot_name, target_pos, target_T, q)
             elapsed = time.perf_counter() - start
-            if sol is None:
+            if sol is None or ikfast_kin is None:
                 dist, ang = float("inf"), float("inf")
             else:
-                result_pos, result_T = _fk_tip_pose(solver, sol, tip_bone)
-                dist = float(np.linalg.norm(result_pos - target_pos))
-                ang = _rotation_angle_deg(target_T, result_T)
+                fk_res = _ikfast_fk(ikfast_kin, sol)
+                if fk_res is None:
+                    dist, ang = float("inf"), float("inf")
+                else:
+                    result_pos, result_T = fk_res
+                    dist = float(np.linalg.norm(result_pos - target_pos))
+                    ang = _rotation_angle_deg(target_T, result_T)
             s = stats_by["ikfast"]
             s.elapsed += elapsed
             if dist <= distance_error and ang <= angle_error_deg:
@@ -510,16 +657,20 @@ def run(
                 q,
             )
             elapsed = time.perf_counter() - start
-            if sol is None:
+            if sol is None or tracik_solver is None:
                 dist, ang = float("inf"), float("inf")
             else:
-                result_pos, result_T = _fk_tip_pose(solver, sol, tip_bone)
-                dist = float(np.linalg.norm(result_pos - target_pos))
-                ang = _rotation_angle_deg(target_T, result_T)
+                fk_res = _tracik_fk(tracik_solver, sol)
+                if fk_res is None:
+                    dist, ang = float("inf"), float("inf")
+                else:
+                    result_pos, result_T = fk_res
+                    dist = float(np.linalg.norm(result_pos - target_pos))
+                    ang = _rotation_angle_deg(target_T, result_T)
             s = stats_by["trac-ik"]
             s.elapsed += elapsed
             if dist <= distance_error and ang <= angle_error_deg:
-                s.success +=  1
+                s.success += 1
             else:
                 s.failure_distance_sum += dist
                 s.failure_angle_sum_deg += ang
@@ -573,7 +724,7 @@ def main() -> None:
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--distance-error", type=float, default=0.01)
     p.add_argument("--angle-error-deg", type=float, default=1.0)
-    p.add_argument("--warmup", type=int, default=2)
+    p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--output-csv", type=str, default="Additional.csv")
     p.add_argument(
         "--compute-sdf", action=argparse.BooleanOptionalAction, default=False
