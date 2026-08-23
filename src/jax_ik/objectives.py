@@ -10,6 +10,36 @@ from jax.tree_util import register_pytree_node_class
 from jax_ik.helper import inverse_skin_points
 
 
+def _safe_norm(x: jnp.ndarray, axis=None, eps: float = 1e-6) -> jnp.ndarray:
+    """L2 norm whose gradient stays finite at x == 0.
+
+    jnp.linalg.norm(x) has an exact-zero-at-the-origin singularity: its
+    gradient is x / ||x||, which is 0/0 (nan) when x is exactly zero. That's
+    not a corner case here -- e.g. a trajectory's consecutive-frame
+    differences start out exactly zero whenever every frame is initialized
+    to the same pose (the common case), so an objective built on
+    jnp.linalg.norm can NaN out on the very first optimization step. Adding
+    eps^2 inside the sqrt instead of eps after it keeps the same forward
+    value at x == 0 (sqrt(eps^2) == eps) while keeping the gradient bounded
+    everywhere.
+    """
+    return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis) + eps * eps)
+
+
+def _safe_arccos(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """arccos whose gradient stays finite at the domain boundary.
+
+    jnp.arccos'(x) = -1/sqrt(1-x^2), which is infinite at x == +-1 -- and two
+    unit vectors landing exactly parallel/antiparallel (cos similarity == 1
+    or -1) is not a rare corner case for a "look at" style objective: it's
+    exactly what happens whenever a bone's rest-pose direction already
+    matches the target direction, e.g. at an all-zero initial pose. Clipping
+    strictly inside (-1, 1) instead of to the closed interval keeps the
+    gradient bounded everywhere.
+    """
+    return jnp.arccos(jnp.clip(x, -1.0 + eps, 1.0 - eps))
+
+
 def get_config(X: jnp.ndarray) -> jnp.ndarray:
     """
     Get the last configuration from a trajectory or return the configuration itself if 1D.
@@ -27,6 +57,48 @@ def get_config(X: jnp.ndarray) -> jnp.ndarray:
 
 
 class ObjectiveFunction(metaclass=ABCMeta):
+    # Opt-in marker: set to True on a subclass whose __call__ *always*
+    # reduces X down to just the trajectory's last frame (via
+    # `X if X.ndim == 1 else X[-1]`), regardless of any of its instance
+    # parameters. The solver loop (_solve_ik_core in ik.py) uses this to
+    # route such objectives through a shared last-frame FK computation
+    # instead of each recomputing FK independently -- see
+    # `_LastFrameFKCache` in ik.py for why that requires this explicit
+    # opt-in rather than being automatic. Leave False (the default) unless
+    # an objective's frame selection is unconditionally "last frame only";
+    # e.g. DistanceObjTraj sometimes reduces to the last frame (a single
+    # target point) but not always (multiple target points sample other
+    # frames too), so it does not opt in.
+    LAST_FRAME_ONLY = False
+
+    def referenced_bones(self):
+        """Which bones this objective instance's __call__ actually reads.
+
+        Used by InverseKinematicsSolver to automatically prune FK down to
+        just the bones any given set of objectives needs (see
+        FKSolver.bones_of_interest / FKSolver._pruned_view): computing FK
+        for bones nothing ever queries is pure waste, and for a typical
+        skeleton, most bones (the other arm, legs, unrelated fingers, ...)
+        are never on the path to anything a given problem's objectives
+        care about.
+
+        Returns:
+            - () if this objective doesn't use FK at all (pure
+              joint-angle-space, e.g. a trajectory smoothness term).
+            - A tuple of specific bone names if it only ever reads those
+              bones (plus their ancestors, which the pruning logic adds
+              automatically) -- the common case.
+            - None (the default here) if it needs the *complete,
+              unpruned* skeleton, e.g. because it walks every bone via
+              fk_solver.bone_names/parent_list, or because it depends on
+              fk_solver.sdf/mesh_data/bind_fk, which are only valid for
+              the bone indexing of the FKSolver they were computed from.
+              None is also the safe default for any custom objective that
+              hasn't overridden this: pruning only ever kicks in once
+              every active objective has explicitly opted in.
+        """
+        return None
+
     def _split_fields(self):
         """Like before but treat ints as auxiliary (static) to avoid tracer in conditionals."""
         leaves, aux = {}, {}
@@ -150,21 +222,9 @@ class DistanceObjTraj(ObjectiveFunction):
             raise ValueError("target_points must have shape (M,3) or (3,)")
 
         self.weight = jnp.asarray(weight, jnp.float32)
-        self._update_ratios()
 
-    def _update_ratios(self) -> None:
-        """
-        Pre-compute the fractions k/M that decide which frames to sample.
-
-        Handles the corner-case M == 0 to avoid divide-by-zero.
-        """
-        M = int(self.target_points.shape[0])
-        if M == 0:
-            self.rat = jnp.zeros((0,), jnp.float32)
-            return
-
-        ks = jnp.arange(1, M + 1, dtype=jnp.float32)  # 1 … M
-        self.rat = ks / jnp.float32(M)  # (M,)
+    def referenced_bones(self):
+        return (self.bone_name,)
 
     def _bone_point(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -197,19 +257,54 @@ class DistanceObjTraj(ObjectiveFunction):
         # Make sure X is 2-D: (T, D)
         X_traj = X.reshape(1, -1) if X.ndim == 1 else X
 
-        # FK for every frame
-        bone_pts = jax.vmap(lambda cfg: self._bone_point(cfg, fk_solver))(
-            X_traj
-        )  # (T, 3)
-
-        T = bone_pts.shape[0]
-        if T == 0 or self.rat.size == 0:
+        T = X_traj.shape[0]
+        M = self.target_points.shape[0]
+        if T == 0 or M == 0:
             return jnp.asarray(0.0, jnp.float32)
 
-        # For non-negative values this is identical to floor(x + 0.5).
-        idx = jnp.rint(self.rat * jnp.float32(T - 1)).astype(jnp.int32)
+        # Which frame each of the M target points is compared against. This
+        # depends only on the static shapes T and M (not on any traced
+        # value), so it can be computed with plain numpy at trace time
+        # instead of being carried as a jnp array leaf.
+        ks = np.arange(1, M + 1, dtype=np.float64)
+        idx = np.rint(ks / M * (T - 1)).astype(np.int64)  # (M,)
 
-        diff = bone_pts[idx] - self.target_points  # (M, 3)
+        # Several target points can map to the same frame (e.g. a single
+        # target point always maps to the last frame). Run FK only on the
+        # distinct frames that are actually needed instead of vmapping over
+        # every frame in the trajectory.
+        unique_idx, inverse = np.unique(idx, return_inverse=True)
+
+        if unique_idx.shape[0] == 1:
+            # Common case (e.g. a single target point): call FK directly on
+            # the one needed frame instead of through vmap. A non-vmapped
+            # call has the same HLO shape as the plain (unbatched) FK calls
+            # other objectives make on that same frame (e.g.
+            # BoneRelativeLookObj), which lets XLA's CSE pass merge them
+            # into a single FK evaluation instead of recomputing it once per
+            # objective.
+            frame_idx = int(unique_idx[0])
+            if frame_idx == T - 1:
+                # When the one needed frame is the trajectory's last frame,
+                # reuse the exact same cfg object _solve_ik_core's FK cache
+                # is keyed on (rather than slicing X_traj ourselves, which
+                # would produce an equal-valued but distinct object and miss
+                # the cache) so this objective's FK forward+backward is
+                # fully shared with every LAST_FRAME_ONLY objective too,
+                # instead of only sharing the forward value via CSE.
+                shared_cfg = getattr(fk_solver, "shared_last_frame_cfg", None)
+                cfg = shared_cfg if shared_cfg is not None else X_traj[frame_idx]
+            else:
+                cfg = X_traj[frame_idx]
+            bone_pt = self._bone_point(cfg, fk_solver)
+            bone_pts = jnp.broadcast_to(bone_pt[None, :], (M, 3))
+        else:
+            bone_pts_unique = jax.vmap(lambda cfg: self._bone_point(cfg, fk_solver))(
+                X_traj[unique_idx]
+            )  # (U, 3)
+            bone_pts = bone_pts_unique[inverse]  # (M, 3)
+
+        diff = bone_pts - self.target_points  # (M, 3)
         return jnp.mean(jnp.square(diff)) * self.weight
 
 
@@ -219,6 +314,8 @@ class BoneRelativeLookObj(ObjectiveFunction):
     Penalise the angle between a bone vector and a user-tweaked target point.
     `modifications` is a list of (index, delta) tuples applied to that point.
     """
+
+    LAST_FRAME_ONLY = True
 
     def __init__(
         self, bone_name: str, use_head: bool, modifications: list, weight: float = 1.0
@@ -238,6 +335,9 @@ class BoneRelativeLookObj(ObjectiveFunction):
         self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
 
         self.weight = jnp.asarray(weight, jnp.float32)
+
+    def referenced_bones(self):
+        return (self.bone_name,)
 
     def __call__(self, X: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
@@ -264,13 +364,13 @@ class BoneRelativeLookObj(ObjectiveFunction):
 
         # compute the angle between the bone vector and the target vector
         bone_vec = tail - head  # head → tail
-        bone_vec = bone_vec / (jnp.linalg.norm(bone_vec) + 1e-6)
+        bone_vec = bone_vec / _safe_norm(bone_vec)
 
         tgt_vec = adjusted_target - head  # head → target
-        tgt_vec = tgt_vec / (jnp.linalg.norm(tgt_vec) + 1e-6)
+        tgt_vec = tgt_vec / _safe_norm(tgt_vec)
 
-        cos_th = jnp.clip(jnp.dot(bone_vec, tgt_vec), -1.0, 1.0)
-        misalign = jnp.arccos(cos_th) ** 2
+        cos_th = jnp.dot(bone_vec, tgt_vec)
+        misalign = _safe_arccos(cos_th) ** 2
         return misalign * self.weight
 
     def update_params(self, params: dict) -> None:  # custom handling for modifications
@@ -294,6 +394,8 @@ class EndEffectorOrientationObj(ObjectiveFunction):
 
     """
 
+    LAST_FRAME_ONLY = True
+
     def __init__(
         self, bone_name: str, target_transform: np.ndarray, weight: float = 1.0
     ):
@@ -304,6 +406,9 @@ class EndEffectorOrientationObj(ObjectiveFunction):
             np.asarray(target_transform, dtype=np.float32)[:3, :3], dtype=jnp.float32
         )
         self.weight = jnp.asarray(weight, dtype=jnp.float32)
+
+    def referenced_bones(self):
+        return (self.bone_name,)
 
     def tree_flatten(self):
         return (self.target_R, self.weight), {"bone_name": self.bone_name}
@@ -345,9 +450,7 @@ class EndEffectorOrientationObj(ObjectiveFunction):
         R_rel = self.target_R.T @ R
 
         w = self._quat_w_from_R(R_rel)
-        # Avoid NaN gradients at the boundary by keeping away from exactly 1.0
-        w = jnp.clip(w, jnp.float32(0.0), jnp.float32(1.0) - jnp.float32(1e-7))
-        angle = jnp.float32(2.0) * jnp.arccos(w)  # radians in [0, pi]
+        angle = jnp.float32(2.0) * _safe_arccos(w)  # radians in [0, pi]
         return jnp.square(angle) * self.weight
 
 @register_pytree_node_class
@@ -369,6 +472,9 @@ class DerivativeObj(ObjectiveFunction):
             self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
         else:
             self.next_frames = jnp.asarray(next_frames, jnp.float32)
+
+    def referenced_bones(self):
+        return ()
 
     # loss -------------------------------------------------------------------
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
@@ -450,6 +556,9 @@ class CombinedDerivativeObj(ObjectiveFunction):
             self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
         else:
             self.next_frames = jnp.asarray(next_frames, jnp.float32)
+
+    def referenced_bones(self):
+        return ()
 
     # loss -------------------------------------------------------------------
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
@@ -533,19 +642,8 @@ class InitPoseObj(ObjectiveFunction):
             else jnp.asarray(mask, jnp.float32).reshape(-1)
         )
 
-    def _loss_single(self, pose: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute the masked mean squared error between a pose and the target.
-
-        Args:
-            pose (jnp.ndarray): Pose to compare.
-
-        Returns:
-            jnp.ndarray: Masked mean squared error.
-        """
-        # Apply mask and compute MSE
-        diff = (pose - self.init_rot) * self.mask
-        return jnp.mean(jnp.square(diff))
+    def referenced_bones(self):
+        return ()
 
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
@@ -567,9 +665,11 @@ class InitPoseObj(ObjectiveFunction):
                 X = X[:1]  # Take only the first pose (slice to keep 2D)
         # If full_trajectory is True, use all poses (X unchanged)
 
-        # Compute loss for selected poses
-        losses = jax.vmap(self._loss_single)(X)
-        return jnp.mean(losses) * self.weight
+        # Every selected pose has the same number of (masked) angles, so the
+        # mean-of-per-pose-means jax.vmap used to compute is exactly the
+        # flat mean over all selected poses' angles -- no need for vmap.
+        diff = (X - self.init_rot) * self.mask
+        return jnp.mean(jnp.square(diff)) * self.weight
 
 
 @register_pytree_node_class
@@ -584,6 +684,9 @@ class EqualDistanceObj(ObjectiveFunction):
             weight (float): Weight for the objective.
         """
         self.weight = jnp.asarray(weight, jnp.float32)
+
+    def referenced_bones(self):
+        return ()
 
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
@@ -600,7 +703,7 @@ class EqualDistanceObj(ObjectiveFunction):
             return jnp.array(0.0, jnp.float32)
 
         diffs = X[1:] - X[:-1]
-        distances = jnp.linalg.norm(diffs, axis=1) + 1e-6
+        distances = _safe_norm(diffs, axis=1)
         mean_dist = jnp.mean(distances)
         penalty = jnp.mean(jnp.square(distances - mean_dist))
         return penalty * self.weight
@@ -626,6 +729,11 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         self.segment_radius = jnp.asarray(segment_radius, jnp.float32)
         self.weight = jnp.asarray(weight, jnp.float32)
 
+    def referenced_bones(self):
+        # Walks every bone (fk_solver.parent_list) to check every segment
+        # against the collider, so it needs the complete, unpruned skeleton.
+        return None
+
     def _penalty_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
         Compute the penalty for a single configuration.
@@ -650,7 +758,7 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         vc = self.center - p_head
         t = jnp.clip(jnp.sum(vc * v, axis=1) / dot_vv, 0.0, 1.0)
         closest = p_head + t[:, None] * v
-        dist = jnp.linalg.norm(self.center - closest, axis=1)
+        dist = _safe_norm(self.center - closest, axis=1)
         penetration = jnp.maximum(0.0, eff_rad - dist)
         return jnp.sum((penetration ** 2) * seg_mask)
 
@@ -706,6 +814,9 @@ class BoneDirectionObjective(ObjectiveFunction):
             self.directions = jnp.array([[0, 1, 0]], dtype=jnp.float32)
         self.weight = jnp.asarray(weight, dtype=jnp.float32)
 
+    def referenced_bones(self):
+        return (self.bone_name,)
+
     def _loss_single(self, cfg: jnp.ndarray, fk_solver) -> jnp.ndarray:
         """
         Compute the normalized squared angle between the bone and desired direction.
@@ -725,19 +836,16 @@ class BoneDirectionObjective(ObjectiveFunction):
         else:
             bone_vector = tail - head
 
-        bone_vector_norm = jnp.linalg.norm(bone_vector) + 1e-6
+        bone_vector_norm = _safe_norm(bone_vector)
         bone_vector_normalized = bone_vector / bone_vector_norm
 
         # Combine directions: sum then normalize
         combined_direction = jnp.sum(self.directions, axis=0)
-        desired_direction = combined_direction / (
-            jnp.linalg.norm(combined_direction) + 1e-6
-        )
+        desired_direction = combined_direction / _safe_norm(combined_direction)
 
         # Calculate dot product and angle
         dot_product = jnp.sum(bone_vector_normalized * desired_direction)
-        dot_product_clipped = jnp.clip(dot_product, -1.0, 1.0)
-        angle_difference = jnp.arccos(dot_product_clipped)
+        angle_difference = _safe_arccos(dot_product)
 
         # Normalize error by pi^2
         normalized_error = jnp.square(angle_difference) / (jnp.pi**2)
@@ -779,13 +887,8 @@ class BoneZeroRotationObj(ObjectiveFunction):
             else jnp.asarray(mask, jnp.float32)
         )
 
-    def _masked_sq_norm(self, pose: jnp.ndarray) -> jnp.ndarray:
-        """Compute masked squared norm of a single pose (mean over dims)."""
-        if self.mask.size == 1:
-            diff = pose * self.mask[0]
-        else:
-            diff = pose * self.mask
-        return jnp.mean(jnp.square(diff))
+    def referenced_bones(self):
+        return ()
 
     def __call__(self, X: jnp.ndarray, fk_solver=None) -> jnp.ndarray:
         """
@@ -798,8 +901,13 @@ class BoneZeroRotationObj(ObjectiveFunction):
         Returns:
             jnp.ndarray: Weighted mean penalty.
         """
+        # self.mask broadcasts against the last (angle) dim whether it's a
+        # single shared value (shape (1,)) or one per angle (shape (D,)), so
+        # no need to branch on its size. Every pose has the same number of
+        # (masked) angles, so the mean-of-per-pose-means jax.vmap used to
+        # compute is exactly the flat mean over all poses' angles.
         poses = X.reshape(-1, X.shape[-1]) if X.ndim > 1 else X[None, :]
-        return jnp.mean(jax.vmap(self._masked_sq_norm)(poses)) * self.weight
+        return jnp.mean(jnp.square(poses * self.mask)) * self.weight
 
 
 @register_pytree_node_class
@@ -824,6 +932,11 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         self.sdf_grid = sdf["grid"]
         self.sdf_origin = sdf["origin"]
         self.sdf_spacing = sdf["spacing"]
+
+    def referenced_bones(self):
+        # sdf is an explicit, external grid (not fk_solver.sdf), so this
+        # only ever needs self.bone_name's own FK, not the whole skeleton.
+        return (self.bone_name,)
 
     def _get_sdf_value(self, points: jnp.ndarray) -> jnp.ndarray:
         """
@@ -907,6 +1020,14 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         self.num_samples_per_bone = int(num_samples_per_bone)
         self.min_dist = jnp.float32(min_dist)
         self.weight = jnp.asarray(weight, jnp.float32)
+
+    def referenced_bones(self):
+        # Needs fk_solver.sdf/mesh_data/bind_fk, which are only valid (and
+        # only computed at all) for the *unpruned* FKSolver they came from
+        # -- a pruned view has none of them. Also, inverse_skin_points
+        # relies on skin-joint indices that reference bone positions in the
+        # full skeleton's own numbering.
+        return None
 
     def _get_sdf_value(self, points: jnp.ndarray, sdf: dict) -> jnp.ndarray:
         """

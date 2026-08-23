@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# JAX persistent compilation cache
+jax_cache/
+
 # Environments
 .env
 .envrc

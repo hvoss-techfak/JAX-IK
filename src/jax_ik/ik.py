@@ -8,7 +8,6 @@ import configargparse
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pyvista as pv
 from jax.tree_util import register_pytree_node_class
 from tqdm import tqdm
 
@@ -77,34 +76,19 @@ def tf_euler_to_matrix(angles: jnp.ndarray) -> jnp.ndarray:
     cx, cy, cz = jnp.cos(angles)
     sx, sy, sz = jnp.sin(angles)
 
-    R_x = jnp.array(
+    # Closed-form for R_z @ R_y @ R_x. Mathematically identical to building
+    # the three 4x4 factor matrices (mostly structural zeros/ones) and
+    # chaining two 4x4 matmuls, but far cheaper -- and this runs on every
+    # forward *and* backward pass of the solver's inner loop.
+    return jnp.array(
         [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, cx, -sx, 0.0],
-            [0.0, sx, cx, 0.0],
+            [cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz, 0.0],
+            [cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz, 0.0],
+            [-sy, sx * cy, cx * cy, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
         dtype=jnp.float32,
     )
-    R_y = jnp.array(
-        [
-            [cy, 0.0, sy, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [-sy, 0.0, cy, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=jnp.float32,
-    )
-    R_z = jnp.array(
-        [
-            [cz, -sz, 0.0, 0.0],
-            [sz, cz, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=jnp.float32,
-    )
-    return R_z @ R_y @ R_x
 
 
 @partial(jax.jit, static_argnums=())
@@ -153,26 +137,40 @@ def tf_rotation_matrix_from_axis_angle(axis: jnp.ndarray, angle: float) -> jnp.n
     return R4
 
 
-@partial(jax.jit, static_argnums=(3,))
+@partial(jax.jit, static_argnums=(3, 5))
 def _compute_fk_tf(
     local_array: jnp.ndarray,
     parent_indices: jnp.ndarray,
     default_rotations: jnp.ndarray,
     controlled_indices: tuple,
     angle_vector: jnp.ndarray,
+    level_bounds: tuple,
 ) -> jnp.ndarray:
     """
     Compute forward kinematics for a skeleton given joint angles.
 
+    Bones are stored (by FKSolver._prepare_fk_arrays) ordered by BFS depth
+    level, with each level occupying a contiguous slice. Rather than walking
+    the hierarchy one bone at a time (N sequential steps), we process one
+    depth level at a time as a single batched matmul: every bone in a level
+    only depends on bones from strictly shallower levels, which have already
+    been resolved. This turns the N-step sequential chain into
+    len(level_bounds) steps (the tree depth), which is far shorter for wide,
+    shallow skeletons.
+
     Args:
-        local_array (jnp.ndarray): Local bind transforms for each bone (N, 4, 4).
-        parent_indices (jnp.ndarray): Parent indices for each bone (N,).
+        local_array (jnp.ndarray): Local bind transforms for each bone (N, 4, 4),
+            ordered by depth level.
+        parent_indices (jnp.ndarray): Parent indices for each bone (N,), indices
+            refer to positions in this same level-sorted ordering.
         default_rotations (jnp.ndarray): Default (identity) rotations for each bone (N, 4, 4).
-        controlled_indices (tuple): Indices of controlled bones.
+        controlled_indices (tuple): Indices of controlled bones (level-sorted space).
         angle_vector (jnp.ndarray): Euler angles for controlled bones (K*3,).
+        level_bounds (tuple): Static tuple of (start, end) slices, one per depth
+            level, into the level-sorted arrays above.
 
     Returns:
-        jnp.ndarray: Global transforms for all bones (N, 4, 4).
+        jnp.ndarray: Global transforms for all bones (N, 4, 4), level-sorted order.
     """
     ctrl_idx_arr = jnp.asarray(controlled_indices, dtype=jnp.int32)
     num_controlled = len(controlled_indices)
@@ -182,24 +180,31 @@ def _compute_fk_tf(
 
     rotations = default_rotations.at[ctrl_idx_arr].set(R_updates)
 
-    n_bones = local_array.shape[0]
+    # local_array and rotations don't depend on `carry`, so this combined
+    # per-bone transform can be computed once, up front, for every bone in
+    # parallel, instead of redoing `local @ rotation` inside each level's
+    # step. That leaves only one (data-dependent) matmul per level on the
+    # sequential critical path instead of two.
+    local_rot = local_array @ rotations
+
     eye4 = jnp.eye(4, dtype=jnp.float32)
+    carry = jnp.zeros_like(local_array)
 
-    # Forward pass through the hierarchy
-    def fk_body(carry, idx):
-        parent_transform = jax.lax.cond(
-            parent_indices[idx] < 0,
-            lambda _: eye4,
-            lambda p: carry[p],
-            operand=parent_indices[idx],
+    # Static Python loop over depth levels (unrolled at trace time): each
+    # level is a batched matmul over its bones, with no cross-level data
+    # dependency other than the already-resolved `carry`.
+    for start, end in level_bounds:
+        level_parents = parent_indices[start:end]
+        safe_parents = jnp.where(level_parents < 0, 0, level_parents)
+        parent_transform = jnp.where(
+            (level_parents < 0)[:, None, None],
+            eye4[None, :, :],
+            carry[safe_parents],
         )
-        current = parent_transform @ local_array[idx] @ rotations[idx]
-        carry = carry.at[idx].set(current)
-        return carry, None
+        current = parent_transform @ local_rot[start:end]
+        carry = carry.at[start:end].set(current)
 
-    init = jnp.zeros_like(local_array)
-    out, _ = jax.lax.scan(fk_body, init, jnp.arange(n_bones))
-    return out
+    return carry
 
 
 @register_pytree_node_class
@@ -217,8 +222,64 @@ class _ZeroObjective(ObjectiveFunction):
     def get_params(self):
         return {}
 
+    def referenced_bones(self):
+        return ()
+
     def __call__(self, X, fk_solver):
         return jnp.float32(0.0)
+
+
+class _LastFrameFKCache:
+    """Wraps an FKSolver so that repeated compute_fk_from_angles(cfg) calls
+    with the exact same `cfg` object reuse one cached result, instead of
+    recomputing FK (and, critically, redifferentiating through it) once per
+    objective that asks for it.
+
+    This matters because JAX's automatic differentiation and XLA's common
+    subexpression elimination operate at different stages: if two objectives
+    independently call fk_solver.compute_fk_from_angles(x_full[-1]), XLA's
+    CSE pass (which runs on the *compiled* graph) can often recognize the
+    two forward computations as identical and dedupe them -- but jax.grad
+    builds its backward pass *before* that, from the traced program as
+    written, so it still produces two separate backward computations
+    through FK, one per call site. The only way to also share that backward
+    work is to make sure the underlying compute_fk_from_angles call really
+    only happens once in the traced program, with its result reused by
+    every consumer -- which is what this cache does, for the specific
+    (structurally common) case of objectives that only ever need the
+    trajectory's last frame; see ObjectiveFunction.LAST_FRAME_ONLY.
+
+    Deliberately created fresh (and thrown away) on every trace of
+    compute_objectives below: its cache is scoped to a single forward+
+    backward pass, so it can't go stale across retraces or leak between
+    them, and it stays fully transparent to any objective that doesn't
+    look for it (via __getattr__ passthrough to the wrapped solver).
+
+    Exposes the shared cfg object as `shared_last_frame_cfg` so that an
+    objective which sometimes (not unconditionally, so it can't just set
+    ObjectiveFunction.LAST_FRAME_ONLY) needs exactly the trajectory's last
+    frame can opt into a cache hit too: instead of slicing X itself (which
+    would produce a *new* array object -- equal in value, but not the same
+    object the cache is keyed on, so it wouldn't hit), it can check for this
+    attribute (e.g. via getattr(fk_solver, "shared_last_frame_cfg", None))
+    and reuse that exact object. See DistanceObjTraj for the one place this
+    is used.
+    """
+
+    def __init__(self, solver, x_full):
+        self._solver = solver
+        self.shared_last_frame_cfg = x_full if x_full.ndim == 1 else x_full[-1]
+        self._cached_fk = None
+
+    def compute_fk_from_angles(self, angle_vector):
+        if angle_vector is self.shared_last_frame_cfg:
+            if self._cached_fk is None:
+                self._cached_fk = self._solver.compute_fk_from_angles(angle_vector)
+            return self._cached_fk
+        return self._solver.compute_fk_from_angles(angle_vector)
+
+    def __getattr__(self, name):
+        return getattr(self._solver, name)
 
 
 _MANDATORY_POOL = []
@@ -401,29 +462,53 @@ def _solve_ik_core(
     upper_b = jnp.tile(upper_bounds[None, :], (free_T, 1))
 
     def compute_objectives(x_full):
+        # Objectives marked LAST_FRAME_ONLY always reduce X down to
+        # `x_full[-1]` internally; routing them through the *same* cfg
+        # object plus a shared FK cache lets JAX share the FK
+        # forward+backward computation across all of them instead of
+        # redoing it once per objective (see _LastFrameFKCache above).
+        # Every objective (not just LAST_FRAME_ONLY ones) gets the cache as
+        # its fk_solver: it's a transparent passthrough for anything that
+        # doesn't ask for shared_last_frame_cfg, but lets an objective whose
+        # need for the last frame is data-dependent (e.g. DistanceObjTraj
+        # with a single target point) opt into a cache hit too.
+        last_frame_fk = _LastFrameFKCache(fksolver, x_full)
+        last_cfg = last_frame_fk.shared_last_frame_cfg
+
+        def call(fn):
+            if fn.LAST_FRAME_ONLY:
+                return fn(last_cfg, last_frame_fk)
+            return fn(x_full, last_frame_fk)
+
         mand = jnp.float32(0.0)
         for fn in mandatory_obj_fns:
-            mand = mand + fn(x_full, fksolver)
+            mand = mand + call(fn)
         opt = jnp.float32(0.0)
         for fn in optional_obj_fns:
-            opt = opt + fn(x_full, fksolver)
+            opt = opt + call(fn)
         # Stabilize: replace NaN/Inf with large finite sentinel
         mand = jnp.nan_to_num(mand, nan=1e6, posinf=1e6, neginf=1e6)
         opt = jnp.nan_to_num(opt, nan=1e6, posinf=1e6, neginf=1e6)
         total = mand + opt
         total = jnp.nan_to_num(total, nan=1e6, posinf=1e6, neginf=1e6)
-        return total, mand, opt
+        return total
 
     def obj_free(x_free):
         x_full = X_full.at[free_indices].set(x_free)
         return compute_objectives(x_full)
 
-    value_and_grad = jax.value_and_grad(lambda x: obj_free(x)[0])
+    value_and_grad = jax.value_and_grad(obj_free)
 
+    # Each iteration needs the objective value *and* gradient both at its
+    # starting point (to take the step) and at the resulting point (to
+    # decide whether it improved on the best-so-far). Naively that's two
+    # forward passes per iteration -- but the "resulting point" of iteration
+    # i is the "starting point" of iteration i+1, so its value/gradient only
+    # need to be computed once. We thread (total, grad) for the *current* x
+    # through the loop state instead of recomputing them at the top of every
+    # iteration, cutting one full (FK-heavy) forward pass per step.
     def gd_step(state):
-        i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
-
-        total, grad = value_and_grad(x)
+        i, x, m, v, best_x, best_total, no_improve, total, grad = state
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
@@ -443,13 +528,11 @@ def _solve_ik_core(
 
         x_new = jnp.clip(x - step, lower_b, upper_b)
 
-        new_total, new_mand, new_opt = obj_free(x_new)
+        new_total, new_grad = value_and_grad(x_new)
         improved = new_total < best_total
 
         best_x = jax.lax.select(improved, x_new, best_x)
         best_total = jnp.minimum(new_total, best_total)
-        best_mand = jnp.minimum(new_mand, best_mand)
-        best_opt = jnp.minimum(new_opt, best_opt)
         no_improve = jax.lax.select(improved, 0, no_improve + 1)
 
         return (
@@ -459,19 +542,20 @@ def _solve_ik_core(
             v,
             best_x,
             best_total,
-            best_mand,
-            best_opt,
             no_improve,
+            new_total,
+            new_grad,
         )
 
     def gd_cond(state):
-        i, x, m, v, best_x, best_total, best_mand, best_opt, no_improve = state
+        i, x, m, v, best_x, best_total, no_improve, total, grad = state
         # Require a minimal number of iterations before allowing threshold-based early stop
         min_thresh_iters = 5
         patience_ret = jnp.logical_and(i < num_steps, no_improve < patience)
         threshold_ret = jnp.logical_or(i < min_thresh_iters, best_total > threshold)
         return jnp.logical_and(patience_ret, threshold_ret)
 
+    total0, grad0 = value_and_grad(x0_free)
     init_state = (
         0,
         x0_free,
@@ -479,9 +563,9 @@ def _solve_ik_core(
         jnp.zeros_like(x0_free),
         x0_free,
         jnp.inf,
-        jnp.inf,
-        jnp.inf,
         0,
+        total0,
+        grad0,
     )
     (
         iterations,
@@ -510,6 +594,7 @@ class FKSolver:
         model_file: str,
         controlled_bones: list = None,
         do_compute_sdf: bool = True,
+        bones_of_interest: list = None,
     ):
         """
         Initialize the FKSolver.
@@ -518,6 +603,17 @@ class FKSolver:
             model_file (str): Path to the model file (GLB, GLTF, or URDF).
             controlled_bones (list): List of bone names to control.
             compute_sdf (bool): Whether to compute the mesh SDF for collision.
+            bones_of_interest (list): Optional. If given, FK is pruned to just
+                these bones plus controlled_bones and all of their ancestors
+                (every other branch of the skeleton is dropped entirely,
+                since nothing on it ever gets queried). Restricting a wide
+                skeleton down to the handful of bones on the path an
+                objective actually needs can substantially cut FK cost, but
+                it means get_bone_head_tail_from_fk (and anything that walks
+                fk_solver.bone_names, e.g. self-collision or mesh skinning)
+                will only see this pruned bone set -- so leave this None
+                (the default: keep the full skeleton) unless you know
+                exactly which bones every objective you'll use will query.
         """
         self.model_file = model_file
         self.file_type = pathlib.Path(model_file).suffix.lower()
@@ -532,20 +628,11 @@ class FKSolver:
         else:
             raise ValueError(f"Unsupported file type: {self.file_type}")
 
-        self._prepare_fk_arrays()
-        self.controlled_bones = controlled_bones if controlled_bones is not None else []
-        self.controlled_indices = [
-            i for i, name in enumerate(self.bone_names) if name in self.controlled_bones
-        ]
-        self.default_rotations = jnp.stack(
-            [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
-        )
-        controlled_map = -np.ones(len(self.bone_names), dtype=np.int32)
-        for j, bone_idx in enumerate(self.controlled_indices):
-            controlled_map[bone_idx] = 3 * j
-        self.controlled_map_array = jnp.asarray(controlled_map, dtype=jnp.int32)
-        zero_angles = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
-        self.bind_fk = self.compute_fk_from_angles(zero_angles)
+        keep_bones = None
+        if bones_of_interest is not None:
+            keep_bones = self._bone_closure(controlled_bones, bones_of_interest)
+
+        self._finish_init(controlled_bones, keep_bones)
 
         if do_compute_sdf:
             # Load mesh and compute SDF
@@ -570,10 +657,75 @@ class FKSolver:
                     "Warning: Could not load mesh data. Self-collision will be disabled."
                 )
 
-    def _prepare_fk_arrays(self) -> None:
+    def _bone_closure(self, controlled_bones: list, extra_bones) -> set:
+        """The set of bones to keep when pruning to bones_of_interest:
+        controlled_bones + extra_bones, plus every one of their ancestors
+        (walking each up to the root). Requires self.skeleton to already be
+        loaded.
+        """
+        wanted = set(controlled_bones or []) | set(extra_bones or [])
+        keep_bones = set()
+        for name in wanted:
+            cur = name
+            while cur is not None and cur not in keep_bones:
+                keep_bones.add(cur)
+                cur = self.skeleton[cur]["parent"]
+        return keep_bones
+
+    def _finish_init(self, controlled_bones: list, keep_bones: set) -> None:
+        """Shared tail of __init__/_pruned_view: build the FK arrays (with
+        optional pruning) and everything derived from them. Assumes
+        self.skeleton is already set.
+        """
+        self._prepare_fk_arrays(keep_bones=keep_bones)
+        self.controlled_bones = controlled_bones if controlled_bones is not None else []
+        self.controlled_indices = [
+            i for i, name in enumerate(self.bone_names) if name in self.controlled_bones
+        ]
+        self.default_rotations = jnp.stack(
+            [jnp.eye(4, dtype=jnp.float32) for _ in self.bone_names], axis=0
+        )
+        zero_angles = jnp.zeros(len(self.controlled_indices) * 3, dtype=jnp.float32)
+        self.bind_fk = self.compute_fk_from_angles(zero_angles)
+
+    @classmethod
+    def _pruned_view(
+        cls, base: "FKSolver", controlled_bones: list, extra_bones
+    ) -> "FKSolver":
+        """Build a new FKSolver that reuses `base`'s already-loaded skeleton
+        dict (no disk I/O, no mesh/SDF recomputation) but with FK pruned to
+        controlled_bones + extra_bones + their ancestors.
+
+        Used by InverseKinematicsSolver to automatically prune FK to just
+        the bones a given set of objectives actually reference -- see
+        ObjectiveFunction.referenced_bones() and
+        InverseKinematicsSolver._fk_solver_for(). The result never has
+        mesh_data/sdf (self-collision/mesh objectives declare
+        referenced_bones() -> None specifically so they're never routed
+        through a pruned view, and instead keep using `base` itself).
+        """
+        solver = cls.__new__(cls)
+        solver.model_file = base.model_file
+        solver.file_type = base.file_type
+        solver.limits = base.limits
+        solver.mesh_data = None
+        solver.sdf = None
+        solver.skeleton = base.skeleton
+
+        keep_bones = solver._bone_closure(controlled_bones, extra_bones)
+        solver._finish_init(controlled_bones, keep_bones)
+        return solver
+
+    def _prepare_fk_arrays(self, keep_bones: set = None) -> None:
         """
         Walk the joint hierarchy and create arrays for FK computation.
         Ensures bones are topologically sorted for FK.
+
+        Args:
+            keep_bones (set): Optional. If given, only these bones (which
+                must already include every one of their ancestors -- see
+                the FKSolver constructor, which builds this set) are kept;
+                every other branch of the skeleton is skipped entirely.
         """
         self.bone_names = []
         self.local_list = []
@@ -583,6 +735,8 @@ class FKSolver:
 
         def dfs(bone_name, parent_index):
             if bone_name in visited:
+                return
+            if keep_bones is not None and bone_name not in keep_bones:
                 return
             visited.add(bone_name)
 
@@ -606,6 +760,40 @@ class FKSolver:
         # Process roots in consistent order
         for root in sorted(roots):
             dfs(root, -1)
+
+        # Reorder bones by BFS depth level (root=0), stable on the DFS order
+        # within a level. Every array/list keyed by bone index (bone_names,
+        # local_list, parent_list, ...) is permuted together, so this is
+        # transparent to all name-based lookups elsewhere. The payoff is that
+        # depth levels become contiguous slices, which lets FK be computed
+        # one level at a time (see _compute_fk_tf) instead of one bone at a
+        # time.
+        n = len(self.bone_names)
+        depth = [0] * n
+        for i in range(n):
+            p = self.parent_list[i]
+            depth[i] = 0 if p < 0 else depth[p] + 1
+
+        order = sorted(range(n), key=lambda i: (depth[i], i))
+        inv_order = [0] * n
+        for new_idx, old_idx in enumerate(order):
+            inv_order[old_idx] = new_idx
+
+        self.bone_names = [self.bone_names[i] for i in order]
+        self.local_list = [self.local_list[i] for i in order]
+        self.parent_list = [
+            -1 if self.parent_list[i] < 0 else inv_order[self.parent_list[i]]
+            for i in order
+        ]
+
+        level_bounds = []
+        start = 0
+        sorted_depths = [depth[i] for i in order]
+        for k in range(1, n + 1):
+            if k == n or sorted_depths[k] != sorted_depths[start]:
+                level_bounds.append((start, k))
+                start = k
+        self.level_bounds = tuple(level_bounds)
 
         # Convert to JAX arrays
         self.local_array = jnp.stack(self.local_list, axis=0)
@@ -644,6 +832,7 @@ class FKSolver:
             self.default_rotations,
             tuple(self.controlled_indices),
             angle_vector,
+            self.level_bounds,
         )
         return result
 
@@ -695,6 +884,11 @@ class FKSolver:
             pv_mesh: Existing PyVista mesh object (optional).
             interactive (bool): If True, show interactive window.
         """
+        # PyVista (and the VTK it pulls in) is a heavy, rendering-only
+        # dependency -- import it lazily so solving IK doesn't pay its
+        # import cost/memory unless a caller actually renders.
+        import pyvista as pv
+
         # Prepare angles
         if angle_vector is None:
             angle_vector = jnp.zeros(
@@ -800,6 +994,13 @@ class InverseKinematicsSolver:
             do_compute_sdf=compute_sdf,
         )
         self.controlled_bones = self.fk_solver.controlled_bones
+        # solve()/solve_guess() automatically prune FK down to just the
+        # bones the objectives passed to that call actually reference (see
+        # _fk_solver_for below) -- cached here so repeated calls with the
+        # same set of objective *types* (the common case: only target
+        # values change between calls) reuse the same pruned FKSolver
+        # instead of rebuilding it, and so JAX only compiles once for it.
+        self._pruned_fk_cache = {}
 
         # Use limits from URDF if available, otherwise use provided bounds
         if self.fk_solver.limits and not bounds:
@@ -870,6 +1071,40 @@ class InverseKinematicsSolver:
         self.num_steps = num_steps
         self.avg_iter_time = None
 
+    def _fk_solver_for(self, mandatory_objective_functions, optional_objective_functions):
+        """Pick the FKSolver to use for a solve() / solve_guess() call:
+        self.fk_solver (the full, unpruned skeleton) if any active
+        objective needs it -- because it declares
+        ObjectiveFunction.referenced_bones() -> None, whether because it
+        walks the whole skeleton or depends on fk_solver.sdf/mesh_data/
+        bind_fk -- otherwise a cached FKSolver pruned to just
+        controlled_bones plus whatever specific bones every objective
+        declared it needs.
+
+        This is what makes bones_of_interest-style pruning automatic:
+        callers never need to work out or pass which bones are needed
+        themselves, and if the set of objectives used from one solve() call
+        to the next doesn't change (the common case -- only target values
+        differ), the same cached pruned FKSolver is reused, so JAX only
+        traces/compiles for it once.
+        """
+        wanted = set(self.controlled_bones)
+        for fn in (*mandatory_objective_functions, *optional_objective_functions):
+            bones = fn.referenced_bones()
+            if bones is None:
+                return self.fk_solver
+            wanted.update(bones)
+
+        key = frozenset(wanted)
+        fk_solver = self._pruned_fk_cache.get(key)
+        if fk_solver is None:
+            extra_bones = wanted - set(self.controlled_bones)
+            fk_solver = FKSolver._pruned_view(
+                self.fk_solver, self.controlled_bones, extra_bones
+            )
+            self._pruned_fk_cache[key] = fk_solver
+        return fk_solver
+
     def solve_guess(
         self,
         initial_rotations: np.ndarray,
@@ -907,7 +1142,9 @@ class InverseKinematicsSolver:
             upper_bounds=self.upper_bounds,
             mandatory_obj_fns=tuple(fn for fn in mandatory_objective_functions),
             optional_obj_fns=tuple(fn for fn in optional_objective_functions),
-            fksolver=self.fk_solver,
+            fksolver=self._fk_solver_for(
+                mandatory_objective_functions, optional_objective_functions
+            ),
             threshold=self.threshold,
             num_steps=self.num_steps,
             learning_rate=learning_rate,
@@ -974,7 +1211,9 @@ class InverseKinematicsSolver:
             upper_bounds=self.upper_bounds,
             mandatory_obj_fns=tuple(fn for fn in mandatory_objective_functions),
             optional_obj_fns=tuple(fn for fn in optional_objective_functions),
-            fksolver=self.fk_solver,
+            fksolver=self._fk_solver_for(
+                mandatory_objective_functions, optional_objective_functions
+            ),
             threshold=self.threshold,
             num_steps=self.num_steps,
             learning_rate=learning_rate,
