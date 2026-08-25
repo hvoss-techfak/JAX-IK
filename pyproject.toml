@@ -27,3 +27,10 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+
+[tool.pytest.ini_options]
+# blender_addon/tests/*.py is a separate, bpy-driven test harness (run via
+# `blender --background --python <file>`, see blender_addon/build_and_install.sh
+# --test) -- every file there but smoothing_test.py imports `bpy`, which only
+# exists inside Blender's own Python, so plain pytest can never collect it.
+testpaths = ["tests"]

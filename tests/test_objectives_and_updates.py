@@ -56,7 +56,9 @@ def solver_with_fake_sdf(solver, fake_sdf):
     return solver
 
 
-def _run_solver_once(solver, mandatory=None, optional=None, traj=False):
+def _run_solver_once(
+    solver, mandatory=None, optional=None, traj=False, learning_rate=0.15, patience=20
+):
     from jax_ik.objectives import DistanceObjTraj
 
     init = np.zeros(len(solver.controlled_bones) * 3, dtype=np.float32)
@@ -75,8 +77,8 @@ def _run_solver_once(solver, mandatory=None, optional=None, traj=False):
         mandatory_objective_functions=mandatory or [],
         optional_objective_functions=optional or [],
         ik_points=1 if not traj else 2,
-        learning_rate=0.15,
-        patience=20,
+        learning_rate=learning_rate,
+        patience=patience,
         verbose=False,
     )
     # After nan guards, loss should always be finite
@@ -89,12 +91,31 @@ def test_distance_obj_and_update(solver):
     obj = DistanceObjTraj(
         bone_name="left_index3", target_points=[t1], use_head=True, weight=1.0
     )
-    res1, loss1, _ = _run_solver_once(solver, mandatory=[obj])
-    params = obj.get_params()
-    params["weight"] = 1.0
-    params["target_points"] = [[0.1, 0.2, 0.5]]
-    obj.update_params(params)
-    res2, loss2, _ = _run_solver_once(solver, mandatory=[obj])
+    # left_index3 isn't itself a controlled bone -- reaching it means driving
+    # it through the 4 upstream arm joints, which needs more optimizer
+    # budget than the shared `solver` fixture's default num_steps=60 to fully
+    # converge rather than stop early: at learning_rate=0.15/patience=20 (the
+    # other tests' defaults) this plateaus around loss=0.007 well before the
+    # true optimum (~6e-7, confirmed by relaxing both), tripping patience's
+    # no-improvement check while still making slow progress rather than
+    # having actually converged. Temporarily raise num_steps for this test
+    # only and restore it after, since `solver` is a session-scoped fixture
+    # shared with every other test in this module.
+    orig_num_steps = solver.num_steps
+    solver.num_steps = 600
+    try:
+        res1, loss1, _ = _run_solver_once(
+            solver, mandatory=[obj], learning_rate=0.05, patience=100
+        )
+        params = obj.get_params()
+        params["weight"] = 1.0
+        params["target_points"] = [[0.1, 0.2, 0.5]]
+        obj.update_params(params)
+        res2, loss2, _ = _run_solver_once(
+            solver, mandatory=[obj], learning_rate=0.05, patience=100
+        )
+    finally:
+        solver.num_steps = orig_num_steps
     # Compare normalized losses (divide by weight). Allow some tolerance for target change
     assert loss1 < 1e-3, "DistanceObjTraj did not converge sufficiently to first target"
     assert loss2 < 1e-3, (
