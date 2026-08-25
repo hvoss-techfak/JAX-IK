@@ -1,0 +1,21 @@
+[project]
+name = "jax-ik-blender"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "jax-ik>=0.2",
+]
+
+# jax-ik declares mesh_to_sdf and pyvista as hard (non-optional) dependencies,
+# but this add-on never imports either of them at runtime (SDF self-collision
+# and interactive rendering are both out of scope -- see README "Limitations").
+# mesh_to_sdf's own dependency chain (-> pyrender -> pyopengl==3.1.0, which has
+# no PyPI wheels at all) makes wheel-only resolution of jax-ik's full declared
+# dependency tree fail outright, so both are overridden away here via an
+# impossible environment marker -- a standard uv technique for dropping an
+# unneeded transitive dependency's subtree without needing it to resolve.
+[tool.uv]
+override-dependencies = [
+    "mesh-to-sdf; sys_platform == 'never'",
+    "pyvista; sys_platform == 'never'",
+]
