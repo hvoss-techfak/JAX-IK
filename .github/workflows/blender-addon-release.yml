@@ -1,0 +1,65 @@
+name: Build and publish Blender addon
+
+# Builds the JAX-IK Blender extension (one .zip per platform, via
+# `blender --command extension build --split-platforms`) and attaches them
+# to the GitHub Release that triggered the run.
+#
+# Runs both when a release is first published and whenever an existing
+# release is edited (e.g. the tag was moved, or the release notes/assets
+# need a rebuild) -- `gh release upload --clobber` overwrites any
+# same-named assets from a previous run so re-runs stay idempotent.
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: write
+
+env:
+  # Pinned so this build is reproducible; bump alongside
+  # blender_manifest.toml's blender_version_min if that ever moves past it.
+  BLENDER_VERSION: 4.2.3
+  BLENDER_VERSION_SHORT: 4.2
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download headless Blender
+        run: |
+          curl -fL -o /tmp/blender.tar.xz \
+            "https://download.blender.org/release/Blender${BLENDER_VERSION_SHORT}/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          sudo mkdir -p /opt/blender
+          sudo tar -xJf /tmp/blender.tar.xz -C /opt/blender --strip-components=1
+          echo "/opt/blender" >> "$GITHUB_PATH"
+
+      - name: Fetch dependency wheels
+        run: ./blender_addon/jax_ik_blender/scripts/build_wheels.sh
+
+      - name: Validate extension manifest
+        run: blender --command extension validate blender_addon/jax_ik_blender
+
+      - name: Build extension packages
+        run: |
+          rm -rf blender_addon/build
+          mkdir -p blender_addon/build
+          blender --command extension build \
+            --source-dir blender_addon/jax_ik_blender \
+            --output-dir blender_addon/build \
+            --split-platforms
+
+      - name: Upload zips to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            blender_addon/build/*.zip --clobber \
+            --repo "${{ github.repository }}"
