@@ -1,0 +1,13 @@
+[flake8]
+# pyflakes cannot correctly analyze Blender's `name: bpy.props.XProperty(...)`
+# class-body annotation idiom: it treats every string literal appearing
+# anywhere inside an annotation expression (property names, descriptions,
+# EnumProperty item tuples, empty-string defaults, ...) as a PEP 484-style
+# forward-reference string that must itself parse as a standalone Python
+# expression. A plain word like "UP" is then flagged as an undefined name
+# (F821) and anything else (e.g. "Show Expanded", "") as a forward-annotation
+# syntax error (F722) -- both false positives, present in effectively every
+# property declaration in this add-on. Excluded rather than suppressed
+# per-code since the add-on's own bpy-driven test suite (blender_addon/tests)
+# is what actually exercises this code.
+extend-exclude = blender_addon
