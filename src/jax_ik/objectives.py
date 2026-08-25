@@ -26,38 +26,6 @@ def _safe_norm(x: jnp.ndarray, axis=None, eps: float = 1e-6) -> jnp.ndarray:
     return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis) + eps * eps)
 
 
-def _pseudo_huber(dist: jnp.ndarray, delta: float) -> jnp.ndarray:
-    """Smooth exact-penalty-style loss: ~dist^2/(2*delta) for dist << delta
-    (quadratic, like MSE, so gradients stay well-behaved near convergence),
-    ~dist - delta/2 for dist >> delta (linear, with gradient magnitude
-    approaching exactly 1 -- i.e. the *caller's own weight*, applied
-    outside this function, becomes the actual asymptotic gradient
-    magnitude, not something further scaled down by delta).
-
-    This matters for DistanceObjTraj specifically because it's almost always
-    combined with other *mandatory* regularizers (e.g. a Zero Rotation /
-    Prefer Current Pose penalty) into one summed loss that gradient descent
-    drives to a joint equilibrium, not to each term's individual zero. Under
-    plain squared-error, DistanceObjTraj's restoring gradient is
-    proportional to the residual distance itself, so it shrinks away to
-    nothing exactly when it's needed most (as distance -> 0), letting a
-    competing regularizer's non-vanishing gradient permanently outweigh it
-    and settle the chain at a real, non-negligible offset from the target.
-    A bounded-below-but-non-vanishing gradient (this function, for
-    dist > delta) keeps out-pulling a competing regularizer's gradient all
-    the way down to a much smaller residual before the two balance -- this
-    is the standard "exact penalty" trick from constrained optimization
-    (an L1-like penalty can enforce a constraint tightly; a quadratic
-    penalty can only ever approximate it). Smoothly blending back to
-    quadratic below `delta` (rather than switching directly to spiky L1)
-    keeps the gradient continuous, so it doesn't fight the cautious-Adam
-    mask/momentum machinery in _solve_ik_core once the residual is already
-    small.
-    """
-    scaled = dist / delta
-    return delta * (jnp.sqrt(1.0 + jnp.square(scaled)) - 1.0)
-
-
 def _safe_arccos(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """arccos whose gradient stays finite at the domain boundary.
 
@@ -270,36 +238,6 @@ class DistanceObjTraj(ObjectiveFunction):
 
         self.weight = np.asarray(weight, np.float32)
 
-        # Fixed (not a constructor arg, not a pytree leaf): see
-        # _pseudo_huber's docstring. Swept empirically on
-        # paper_evaluation/ik_jax_lib_bench_drag.py. A small delta (e.g.
-        # 0.01-0.1) makes the *asymptotic* gradient kick in almost
-        # immediately -- with the original (0.9/0.99) Adam beta defaults
-        # that caused persistent overshoot oscillation instead of smooth
-        # convergence, so a much larger 0.6 was picked initially to stay in
-        # the quadratic-like regime. Once the Adam beta1/beta2 defaults
-        # were separately retuned to 0.99/0.995 (see solve_ik) for this
-        # same benchmark's short-horizon dynamics, that oscillation
-        # stopped happening even at small delta -- re-sweeping delta under
-        # the new betas found 0.065 clearly better than 0.6 (dist_mean
-        # 0.008208 -> 0.001028, dist_std 0.003469 -> 0.000468), so a small
-        # delta was the right choice all along; it just needed the
-        # matching beta values to be stable. A further joint (delta,
-        # beta1, beta2) grid search around this point found 0.055/0.99/
-        # 0.997 (see solve_ik's beta2 default) as a slightly better and
-        # more robust combination (dist_mean 0.001028 -> 0.000827,
-        # dist_std 0.000468 -> 0.000384, dist_max 0.002963 -> 0.002132).
-        # After ik.py's _MASK_WARMUP was added (which shifts the
-        # convergence profile of every solve), re-sweeping delta found
-        # 0.046 clearly better and -- checked against its immediate
-        # neighbors (0.044/0.045/0.046 all landed within ~1% of each
-        # other) -- a robust cluster, not an isolated lucky spike like a
-        # couple of nearby single points that tested far worse (e.g. 0.041
-        # and 0.043 both regressed sharply; see the joint sweep in
-        # feedback_jax_ik_drag_spread_tricks.md's cautionary note about
-        # not trusting isolated improvements at this scale).
-        self._huber_delta = 0.046
-
     def referenced_bones(self):
         return (self.bone_name,)
 
@@ -382,8 +320,7 @@ class DistanceObjTraj(ObjectiveFunction):
             bone_pts = bone_pts_unique[inverse]  # (M, 3)
 
         diff = bone_pts - self.target_points  # (M, 3)
-        dist = _safe_norm(diff, axis=-1)  # (M,) -- Euclidean, not per-component
-        return jnp.mean(_pseudo_huber(dist, self._huber_delta)) * self.weight
+        return jnp.mean(jnp.square(diff)) * self.weight
 
 
 @register_pytree_node_class
