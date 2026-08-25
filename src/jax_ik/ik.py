@@ -297,7 +297,7 @@ def solve_ik(
     num_steps: int = 1000,
     learning_rate: float = 0.1,
     beta1: float = 0.9,
-    beta2: float = 0.999,
+    beta2: float = 0.99,
     epsilon: float = 1e-8,
     patience: int = 200,
     mask: np.ndarray = None,
@@ -305,14 +305,29 @@ def solve_ik(
     """
     Solve inverse kinematics using Adam optimizer and a set of objectives.
 
+    Mandatory and optional objectives are both optimized every step (their
+    gradients are summed into one combined loss, so optional objectives
+    genuinely shape the pose throughout), but only the mandatory objectives'
+    summed loss gates convergence and is reported back as the best-loss
+    value: once it falls below `threshold`, the solve is considered
+    successful and may stop early, regardless of how far optional objectives
+    still have to go. If no mandatory objectives are given, this falls back
+    to gating on the combined (mandatory + optional) loss instead, matching
+    the historical behavior for optional-only solves.
+
     Args:
         init_rot (np.ndarray): Initial joint angles.
         lower_bounds (jnp.ndarray): Lower joint limits.
         upper_bounds (jnp.ndarray): Upper joint limits.
-        mandatory_obj_fns (list): List of mandatory objective functions.
-        optional_obj_fns (list): List of optional objective functions.
+        mandatory_obj_fns (list): List of mandatory objective functions --
+            must converge below `threshold` for the solve to be considered
+            successful.
+        optional_obj_fns (list): List of optional objective functions --
+            still optimized every step, but never required to converge.
         fksolver (FKSolver): Forward kinematics solver.
-        threshold (float): Stop if loss falls below this value.
+        threshold (float): Stop once the mandatory objectives' summed loss
+            falls below this value (or the combined loss, if there are no
+            mandatory objectives).
         num_steps (int): Maximum number of optimization steps.
         learning_rate (float): Adam optimizer learning rate.
         beta1 (float): Adam beta1 parameter.
@@ -322,7 +337,9 @@ def solve_ik(
         mask (np.ndarray): Boolean mask for which frames to optimize.
 
     Returns:
-        tuple: (iterations, final_angles, best_loss, status_code)
+        tuple: (iterations, final_angles, best_loss, status_code) -- best_loss
+            is the best mandatory-objective loss seen (or best combined loss,
+            if there are no mandatory objectives).
     """
     MAX_MANDATORY = 10
     MAX_OPTIONAL = 10
@@ -366,6 +383,12 @@ def solve_ik(
 
         return tuple(pool)
 
+    # Whether the caller supplied any *real* mandatory objective, captured
+    # before pool-padding (which always yields a fixed 10-slot tuple and
+    # would otherwise hide this). Passed through as a static jit argument so
+    # _solve_ik_core can gate convergence on mandatory-only loss.
+    has_mandatory = len(mandatory_obj_fns) > 0
+
     static_mandatory = _populate(_MANDATORY_POOL, mandatory_obj_fns)
     static_optional = _populate(_OPTIONAL_POOL, optional_obj_fns)
 
@@ -393,6 +416,7 @@ def solve_ik(
         beta2=beta2,
         epsilon=epsilon,
         patience=patience,
+        has_mandatory=has_mandatory,
         free_indices=free_indices,
     )
 
@@ -408,6 +432,7 @@ def solve_ik(
         10,  # beta2
         11,  # epsilon
         12,  # patience
+        13,  # has_mandatory
     ),
 )
 def _solve_ik_core(
@@ -421,9 +446,10 @@ def _solve_ik_core(
     num_steps: int = 1000,
     learning_rate: float = 0.0001,
     beta1: float = 0.9,
-    beta2: float = 0.999,
+    beta2: float = 0.99,
     epsilon: float = 1e-8,
     patience: int = 200,
+    has_mandatory: bool = True,
     free_indices: jnp.ndarray = None,
 ) -> tuple:
     """
@@ -433,20 +459,30 @@ def _solve_ik_core(
         init_rot (jnp.ndarray): Initial joint angles.
         lower_bounds (jnp.ndarray): Lower joint limits.
         upper_bounds (jnp.ndarray): Upper joint limits.
-        mandatory_obj_fns (tuple): Tuple of mandatory objective functions.
-        optional_obj_fns (tuple): Tuple of optional objective functions.
+        mandatory_obj_fns (tuple): Tuple of mandatory objective functions --
+            must converge below `threshold` for the solve to be considered
+            successful.
+        optional_obj_fns (tuple): Tuple of optional objective functions --
+            still optimized every step, but never required to converge.
         fksolver (FKSolver): Forward kinematics solver.
-        threshold (float): Stop if loss falls below this value.
+        threshold (float): Stop once the mandatory objectives' summed loss
+            falls below this value (or the combined loss, if `has_mandatory`
+            is False).
         num_steps (int): Maximum number of optimization steps.
         learning_rate (float): Adam optimizer learning rate.
         beta1 (float): Adam beta1 parameter.
         beta2 (float): Adam beta2 parameter.
         epsilon (float): Adam epsilon parameter.
         patience (int): Early stopping patience.
+        has_mandatory (bool): Whether any real (non-padding) mandatory
+            objective was supplied. Static: gates whether convergence/best
+            selection is judged on mandatory-only loss or combined loss.
         free_indices (jnp.ndarray): Indices of frames to optimize.
 
     Returns:
-        tuple: (iterations, final_angles, best_loss, status_code)
+        tuple: (iterations, final_angles, best_loss, status_code) -- best_loss
+            is the best mandatory-objective loss seen (or best combined loss,
+            if `has_mandatory` is False).
     """
     init_rot = jnp.asarray(init_rot, dtype=jnp.float32)
     lower_bounds = jnp.asarray(lower_bounds, dtype=jnp.float32)
@@ -491,13 +527,17 @@ def _solve_ik_core(
         opt = jnp.nan_to_num(opt, nan=1e6, posinf=1e6, neginf=1e6)
         total = mand + opt
         total = jnp.nan_to_num(total, nan=1e6, posinf=1e6, neginf=1e6)
-        return total
+        return total, mand
 
     def obj_free(x_free):
         x_full = X_full.at[free_indices].set(x_free)
         return compute_objectives(x_full)
 
-    value_and_grad = jax.value_and_grad(obj_free)
+    # has_aux=True: gradient descent still steps on the combined `total`
+    # (mand + opt), so optional objectives keep shaping the pose every
+    # iteration -- `mand` just rides along from the same forward pass so
+    # convergence/best-selection can be judged on it separately, below.
+    value_and_grad = jax.value_and_grad(obj_free, has_aux=True)
 
     # Each iteration needs the objective value *and* gradient both at its
     # starting point (to take the step) and at the resulting point (to
@@ -508,18 +548,21 @@ def _solve_ik_core(
     # through the loop state instead of recomputing them at the top of every
     # iteration, cutting one full (FK-heavy) forward pass per step.
     def gd_step(state):
-        i, x, m, v, best_x, best_total, no_improve, total, grad = state
+        i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad = state
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
-        m_hat = m / (1.0 - beta1 ** (i + 1))
+        # NAdam-style Nesterov-blended numerator (Dozat 2016): mixes in a
+        # bias-corrected *current* gradient term alongside the usual
+        # bias-corrected momentum, instead of using momentum alone.
+        m_hat = beta1 * (m / (1.0 - beta1 ** (i + 2))) + (1.0 - beta1) * grad / (
+            1.0 - beta1 ** (i + 1)
+        )
         v_hat = v / (1.0 - beta2 ** (i + 1))
 
         # Cautious optimizer modification
-        # Create mask where exponential moving average and gradient have same sign
-        mask = (m * grad > 0).astype(grad.dtype)
-        # Normalize mask by its mean, clamped to avoid division by very small numbers
-        mask = mask / jnp.maximum(mask.mean(), 1e-3)
+        # Create mask where the NAdam-blended numerator and gradient have same sign
+        mask = (m_hat * grad > 0).astype(grad.dtype)
 
         # Apply cautious mask to the normalized gradient
         denom = jnp.sqrt(v_hat) + epsilon
@@ -528,11 +571,24 @@ def _solve_ik_core(
 
         x_new = jnp.clip(x - step, lower_b, upper_b)
 
-        new_total, new_grad = value_and_grad(x_new)
-        improved = new_total < best_total
+        (new_total, new_mand), new_grad = value_and_grad(x_new)
+
+        # "Best" is judged on mandatory loss alone (total as a tie-break)
+        # once there's a real mandatory objective, so a step that improves
+        # optional at mandatory's expense is never adopted as best; with no
+        # mandatory objectives this reduces to the historical total-only
+        # comparison.
+        if has_mandatory:
+            improved = jnp.logical_or(
+                new_mand < best_mand,
+                jnp.logical_and(new_mand <= best_mand, new_total < best_total),
+            )
+        else:
+            improved = new_total < best_total
 
         best_x = jax.lax.select(improved, x_new, best_x)
-        best_total = jnp.minimum(new_total, best_total)
+        best_mand = jax.lax.select(improved, new_mand, best_mand)
+        best_total = jax.lax.select(improved, new_total, best_total)
         no_improve = jax.lax.select(improved, 0, no_improve + 1)
 
         return (
@@ -541,21 +597,24 @@ def _solve_ik_core(
             m,
             v,
             best_x,
+            best_mand,
             best_total,
             no_improve,
             new_total,
+            new_mand,
             new_grad,
         )
 
     def gd_cond(state):
-        i, x, m, v, best_x, best_total, no_improve, total, grad = state
+        i, x, m, v, best_x, best_mand, best_total, no_improve, total, mand, grad = state
         # Require a minimal number of iterations before allowing threshold-based early stop
-        min_thresh_iters = 5
+        min_thresh_iters = 1
         patience_ret = jnp.logical_and(i < num_steps, no_improve < patience)
-        threshold_ret = jnp.logical_or(i < min_thresh_iters, best_total > threshold)
+        convergence_metric = best_mand if has_mandatory else best_total
+        threshold_ret = jnp.logical_or(i < min_thresh_iters, convergence_metric > threshold)
         return jnp.logical_and(patience_ret, threshold_ret)
 
-    total0, grad0 = value_and_grad(x0_free)
+    (total0, mand0), grad0 = value_and_grad(x0_free)
     init_state = (
         0,
         x0_free,
@@ -563,8 +622,10 @@ def _solve_ik_core(
         jnp.zeros_like(x0_free),
         x0_free,
         jnp.inf,
+        jnp.inf,
         0,
         total0,
+        mand0,
         grad0,
     )
     (
@@ -573,14 +634,17 @@ def _solve_ik_core(
         _,
         _,
         _,
+        best_mand,
         best_total,
+        _,
         _,
         _,
         _,
     ) = jax.lax.while_loop(gd_cond, gd_step, init_state)
 
     final_traj = X_full.at[free_indices].set(best_free)
-    return iterations, final_traj, best_total, jnp.int32(0)
+    best_metric = best_mand if has_mandatory else best_total
+    return iterations, final_traj, best_metric, jnp.int32(0)
 
 
 class FKSolver:
@@ -1178,30 +1242,37 @@ class InverseKinematicsSolver:
         Returns:
             tuple: (final_angles, best_loss, steps)
         """
+        # Assembled with plain numpy, not jnp, deliberately: each eager jnp
+        # call (concatenate/tile/...) is its own dispatch to the XLA
+        # runtime, and this array bookkeeping doesn't need a device at all
+        # -- solve_ik does a single jnp.asarray on the finished X_full/mask
+        # below, so preparing them on the host keeps this call down to one
+        # dispatch total instead of several.
         if initial_rotations is None:
             initial_rotations = np.zeros(self.lower_bounds.shape, dtype=np.float32)
-        initial_rotations = jnp.asarray(initial_rotations, dtype=jnp.float32)
+        else:
+            initial_rotations = np.asarray(initial_rotations, dtype=np.float32)
 
         if ik_points < 1:
             ik_points = 1
 
         if initial_rotations.ndim == 1:
-            X_full = jnp.concatenate(
+            X_full = np.concatenate(
                 [
                     initial_rotations[None, :],
-                    jnp.tile(initial_rotations[None, :], (ik_points, 1)),
+                    np.tile(initial_rotations[None, :], (ik_points, 1)),
                 ],
                 axis=0,
             )
-            mask = jnp.concatenate(
-                [jnp.array([False]), jnp.ones(ik_points, dtype=bool)], axis=0
+            mask = np.concatenate(
+                [np.array([False]), np.ones(ik_points, dtype=bool)], axis=0
             )
         else:
             T_current = initial_rotations.shape[0]
-            extension = jnp.tile(initial_rotations[-1][None, :], (ik_points, 1))
-            X_full = jnp.concatenate([initial_rotations, extension], axis=0)
-            mask = jnp.concatenate(
-                [jnp.zeros(T_current, dtype=bool), jnp.ones(ik_points, dtype=bool)],
+            extension = np.tile(initial_rotations[-1][None, :], (ik_points, 1))
+            X_full = np.concatenate([initial_rotations, extension], axis=0)
+            mask = np.concatenate(
+                [np.zeros(T_current, dtype=bool), np.ones(ik_points, dtype=bool)],
                 axis=0,
             )
 

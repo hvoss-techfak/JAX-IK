@@ -174,7 +174,12 @@ class ObjectiveFunction(metaclass=ABCMeta):
             if hasattr(self, k):
                 cur = getattr(self, k)
                 if isinstance(cur, (jnp.ndarray, np.ndarray, jnp.generic)):
-                    v = jnp.asarray(v, jnp.float32)
+                    # numpy, not jnp: this pool object is only ever handed
+                    # to solve_ik() as a pytree leaf, and jax.jit's own
+                    # argument handling device_puts pytree leaves when the
+                    # jitted call actually happens -- doing it again here,
+                    # eagerly, on every update, would just be thrown away.
+                    v = np.asarray(v, np.float32)
                 setattr(self, k, v)
 
     def __call__(self, X: jnp.ndarray, fk_solver) -> jnp.ndarray:
@@ -215,13 +220,23 @@ class DistanceObjTraj(ObjectiveFunction):
         self.bone_name = bone_name
         self.use_head = bool(use_head)
 
-        self.target_points = jnp.asarray(target_points, jnp.float32)
+        # Stored as numpy, not jnp: this is pure pytree-leaf bookkeeping at
+        # construction time, no jax computation happens here. Using jnp
+        # would device_put eagerly, and then -- for the common pattern of
+        # constructing a fresh objective each solve and handing it to
+        # solve_ik(), which pools/updates existing objective instances via
+        # get_params()/update_params() to avoid a JIT retrace -- get_params
+        # would immediately device_get it straight back off, just to have
+        # update_params device_put it again. Staying on numpy until
+        # update_params (or solve_ik's jit boundary) actually needs a
+        # device array avoids that round trip entirely.
+        self.target_points = np.asarray(target_points, np.float32)
         if self.target_points.ndim == 1:
             self.target_points = self.target_points[None, :]
         if self.target_points.shape[-1] != 3:
             raise ValueError("target_points must have shape (M,3) or (3,)")
 
-        self.weight = jnp.asarray(weight, jnp.float32)
+        self.weight = np.asarray(weight, np.float32)
 
     def referenced_bones(self):
         return (self.bone_name,)
@@ -330,11 +345,12 @@ class BoneRelativeLookObj(ObjectiveFunction):
         self.bone_name = bone_name
         self.use_head = bool(use_head)
 
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
         mods = modifications or []
-        self.mod_idx = jnp.asarray([m[0] for m in mods], jnp.int32)
-        self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
+        self.mod_idx = np.asarray([m[0] for m in mods], np.int32)
+        self.mod_delta = np.asarray([m[1] for m in mods], np.float32)
 
-        self.weight = jnp.asarray(weight, jnp.float32)
+        self.weight = np.asarray(weight, np.float32)
 
     def referenced_bones(self):
         return (self.bone_name,)
@@ -374,12 +390,13 @@ class BoneRelativeLookObj(ObjectiveFunction):
         return misalign * self.weight
 
     def update_params(self, params: dict) -> None:  # custom handling for modifications
+        # numpy, not jnp -- see the base class's update_params for why.
         if "modifications" in params:
             mods = params["modifications"] or []
-            self.mod_idx = jnp.asarray([m[0] for m in mods], jnp.int32)
-            self.mod_delta = jnp.asarray([m[1] for m in mods], jnp.float32)
+            self.mod_idx = np.asarray([m[0] for m in mods], np.int32)
+            self.mod_delta = np.asarray([m[1] for m in mods], np.float32)
         if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
+            self.weight = np.asarray(params["weight"], np.float32)
         if "use_head" in params:
             self.use_head = bool(params["use_head"])
         # ignore unknown keys (no-op)
@@ -401,11 +418,14 @@ class EndEffectorOrientationObj(ObjectiveFunction):
     ):
         import jax.numpy as jnp
 
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why. (Contrast
+        # with tree_unflatten below, which *does* need jnp: it reconstructs
+        # this object from already-traced pytree leaves during jax's own
+        # tracing/unflattening, where a plain numpy conversion would choke
+        # on a tracer.)
         self.bone_name = bone_name
-        self.target_R = jnp.asarray(
-            np.asarray(target_transform, dtype=np.float32)[:3, :3], dtype=jnp.float32
-        )
-        self.weight = jnp.asarray(weight, dtype=jnp.float32)
+        self.target_R = np.asarray(target_transform, dtype=np.float32)[:3, :3]
+        self.weight = np.asarray(weight, dtype=np.float32)
 
     def referenced_bones(self):
         return (self.bone_name,)
@@ -467,11 +487,12 @@ class DerivativeObj(ObjectiveFunction):
         if order not in (1, 2, 3):
             raise ValueError("order must be 1, 2 or 3")
         self.order = int(order)
-        self.weight = jnp.asarray(weight, jnp.float32)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.weight = np.asarray(weight, np.float32)
         if next_frames is None:
-            self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
+            self.next_frames = np.zeros((0, 53), dtype=np.float32)
         else:
-            self.next_frames = jnp.asarray(next_frames, jnp.float32)
+            self.next_frames = np.asarray(next_frames, np.float32)
 
     def referenced_bones(self):
         return ()
@@ -509,8 +530,9 @@ class DerivativeObj(ObjectiveFunction):
         return jnp.mean(jnp.square(diff)) * self.weight
 
     def update_params(self, params: dict) -> None:
+        # numpy, not jnp -- see the base class's update_params for why.
         if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
+            self.weight = np.asarray(params["weight"], np.float32)
         # order treated static; ignore updates
 
 
@@ -542,20 +564,21 @@ class CombinedDerivativeObj(ObjectiveFunction):
         self.max_order = int(max_order)
 
         # If specific weights for each order are provided, use them
-        # Otherwise use the same weight for all orders
+        # Otherwise use the same weight for all orders.
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
         if weights is not None:
             if len(weights) != max_order:
                 raise ValueError(
                     f"weights must have length {max_order} for max_order {max_order}"
                 )
-            self.weights = jnp.asarray(weights, jnp.float32)
+            self.weights = np.asarray(weights, np.float32)
         else:
-            self.weights = jnp.full(max_order, weight, dtype=jnp.float32)
+            self.weights = np.full(max_order, weight, dtype=np.float32)
 
         if next_frames is None:
-            self.next_frames = jnp.zeros((0, 53), dtype=jnp.float32)
+            self.next_frames = np.zeros((0, 53), dtype=np.float32)
         else:
-            self.next_frames = jnp.asarray(next_frames, jnp.float32)
+            self.next_frames = np.asarray(next_frames, np.float32)
 
     def referenced_bones(self):
         return ()
@@ -602,11 +625,12 @@ class CombinedDerivativeObj(ObjectiveFunction):
         return total_loss
 
     def update_params(self, params: dict) -> None:
+        # numpy, not jnp -- see the base class's update_params for why.
         if "weights" in params:
             w = params["weights"]
-            self.weights = jnp.asarray(w, jnp.float32)
+            self.weights = np.asarray(w, np.float32)
         elif "weight" in params:
-            self.weights = jnp.full(self.max_order, params["weight"], dtype=jnp.float32)
+            self.weights = np.full(self.max_order, params["weight"], dtype=np.float32)
 
 
 @register_pytree_node_class
@@ -631,15 +655,16 @@ class InitPoseObj(ObjectiveFunction):
             weight (float): Weight for the objective.
             mask (np.ndarray): Optional mask for which angles to anchor.
         """
-        self.init_rot = jnp.asarray(init_rot, jnp.float32).reshape(-1)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.init_rot = np.asarray(init_rot, np.float32).reshape(-1)
         self.full_trajectory = bool(full_trajectory)
         self.last_position = bool(last_position)
-        self.weight = jnp.asarray(weight, jnp.float32)
+        self.weight = np.asarray(weight, np.float32)
 
         self.mask = (
-            jnp.ones_like(self.init_rot)
+            np.ones_like(self.init_rot)
             if mask is None
-            else jnp.asarray(mask, jnp.float32).reshape(-1)
+            else np.asarray(mask, np.float32).reshape(-1)
         )
 
     def referenced_bones(self):
@@ -683,7 +708,8 @@ class EqualDistanceObj(ObjectiveFunction):
         Args:
             weight (float): Weight for the objective.
         """
-        self.weight = jnp.asarray(weight, jnp.float32)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.weight = np.asarray(weight, np.float32)
 
     def referenced_bones(self):
         return ()
@@ -723,11 +749,12 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
             min_clearance (float): Minimum allowed clearance from the sphere.
             segment_radius (float): Radius of the bone segment.
         """
-        self.center = jnp.asarray(sphere_collider["center"], jnp.float32)
-        self.radius = jnp.asarray(sphere_collider["radius"], jnp.float32)
-        self.min_clearance = jnp.asarray(min_clearance, jnp.float32)
-        self.segment_radius = jnp.asarray(segment_radius, jnp.float32)
-        self.weight = jnp.asarray(weight, jnp.float32)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.center = np.asarray(sphere_collider["center"], np.float32)
+        self.radius = np.asarray(sphere_collider["radius"], np.float32)
+        self.min_clearance = np.asarray(min_clearance, np.float32)
+        self.segment_radius = np.asarray(segment_radius, np.float32)
+        self.weight = np.asarray(weight, np.float32)
 
     def referenced_bones(self):
         # Walks every bone (fk_solver.parent_list) to check every segment
@@ -780,8 +807,9 @@ class SphereCollisionPenaltyObjTraj(ObjectiveFunction):
         return loss * jnp.float32(self.weight)
 
     def update_params(self, params: dict) -> None:
+        # numpy, not jnp -- see the base class's update_params for why.
         if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
+            self.weight = np.asarray(params["weight"], np.float32)
 
 @register_pytree_node_class
 class BoneDirectionObjective(ObjectiveFunction):
@@ -803,16 +831,17 @@ class BoneDirectionObjective(ObjectiveFunction):
             directions (list): List of desired direction vectors.
             weight (float): Weight for the objective.
         """
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
         self.bone_name = bone_name
         self.use_head = use_head
 
         if directions is not None:
             self.raw_directions = directions
-            self.directions = jnp.asarray(directions, dtype=jnp.float32)
+            self.directions = np.asarray(directions, dtype=np.float32)
         else:
             self.raw_directions = [[0, 1, 0]]
-            self.directions = jnp.array([[0, 1, 0]], dtype=jnp.float32)
-        self.weight = jnp.asarray(weight, dtype=jnp.float32)
+            self.directions = np.array([[0, 1, 0]], dtype=np.float32)
+        self.weight = np.asarray(weight, dtype=np.float32)
 
     def referenced_bones(self):
         return (self.bone_name,)
@@ -880,11 +909,10 @@ class BoneZeroRotationObj(ObjectiveFunction):
             weight (float): Weight for the objective.
             mask (np.ndarray): Optional mask for which angles to penalize.
         """
-        self.weight = jnp.asarray(weight, jnp.float32)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.weight = np.asarray(weight, np.float32)
         self.mask = (
-            jnp.ones([1], jnp.float32)
-            if mask is None
-            else jnp.asarray(mask, jnp.float32)
+            np.ones([1], np.float32) if mask is None else np.asarray(mask, np.float32)
         )
 
     def referenced_bones(self):
@@ -928,7 +956,8 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         """
         self.bone_name = bone_name
         self.num_samples = int(num_samples)
-        self.weight = jnp.asarray(weight, jnp.float32)
+        # numpy, not jnp -- see DistanceObjTraj.__init__ for why.
+        self.weight = np.asarray(weight, np.float32)
         self.sdf_grid = sdf["grid"]
         self.sdf_origin = sdf["origin"]
         self.sdf_spacing = sdf["spacing"]
@@ -992,8 +1021,9 @@ class SDFCollisionPenaltyObj(ObjectiveFunction):
         return jnp.mean(losses) * self.weight
 
     def update_params(self, params: dict) -> None:
+        # numpy, not jnp -- see the base class's update_params for why.
         if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
+            self.weight = np.asarray(params["weight"], np.float32)
 
 
 @register_pytree_node_class
@@ -1018,8 +1048,12 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         """
         self.bone_names = tuple(bone_names)
         self.num_samples_per_bone = int(num_samples_per_bone)
+        # min_dist stays a jnp.generic scalar (not np) deliberately: that's
+        # what makes _split_fields treat it as a dynamic pytree leaf rather
+        # than a baked-in static constant -- see DistanceObjTraj.__init__
+        # for why array-shaped fields are numpy instead.
         self.min_dist = jnp.float32(min_dist)
-        self.weight = jnp.asarray(weight, jnp.float32)
+        self.weight = np.asarray(weight, np.float32)
 
     def referenced_bones(self):
         # Needs fk_solver.sdf/mesh_data/bind_fk, which are only valid (and
@@ -1108,7 +1142,8 @@ class SDFSelfCollisionPenaltyObj(ObjectiveFunction):
         return jnp.mean(losses) * self.weight
 
     def update_params(self, params: dict) -> None:
+        # numpy, not jnp -- see the base class's update_params for why.
         if "weight" in params:
-            self.weight = jnp.asarray(params["weight"], jnp.float32)
+            self.weight = np.asarray(params["weight"], np.float32)
         if "min_dist" in params:
             self.min_dist = jnp.float32(params["min_dist"])
