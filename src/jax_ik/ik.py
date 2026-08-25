@@ -285,6 +285,19 @@ class _LastFrameFKCache:
 _MANDATORY_POOL = []
 _OPTIONAL_POOL = []
 
+# Number of initial steps (per solve) where gd_step's cautious mask is
+# forced to all-ones instead of the usual (m_hat * grad > 0) gate -- see
+# gd_step below. Momentum starts at exactly zero, so the mask's own
+# momentum-vs-gradient agreement test is close to arbitrary for the first
+# few steps regardless of which direction is actually useful; forcing it
+# open lets those early steps make real progress instead of being
+# randomly half-vetoed while momentum is still warming up. Swept
+# empirically on paper_evaluation/ik_jax_lib_bench_drag.py: 12 gave a
+# further ~3% reduction in dist_mean/dist_std over the always-on cautious
+# mask, at some extra iterations/wall-clock cost (the mask being open
+# longer means more steps before patience-based early stop can trigger).
+_MASK_WARMUP = 12
+
 
 def solve_ik(
     init_rot: np.ndarray,
@@ -296,8 +309,8 @@ def solve_ik(
     threshold: float = 0.01,
     num_steps: int = 1000,
     learning_rate: float = 0.1,
-    beta1: float = 0.9,
-    beta2: float = 0.99,
+    beta1: float = 0.99,
+    beta2: float = 0.997,
     epsilon: float = 1e-8,
     patience: int = 200,
     mask: np.ndarray = None,
@@ -446,7 +459,7 @@ def _solve_ik_core(
     num_steps: int = 1000,
     learning_rate: float = 0.0001,
     beta1: float = 0.9,
-    beta2: float = 0.99,
+    beta2: float = 0.999,
     epsilon: float = 1e-8,
     patience: int = 200,
     has_mandatory: bool = True,
@@ -552,17 +565,30 @@ def _solve_ik_core(
 
         m = beta1 * m + (1.0 - beta1) * grad
         v = beta2 * v + (1.0 - beta2) * jnp.square(grad)
-        # NAdam-style Nesterov-blended numerator (Dozat 2016): mixes in a
-        # bias-corrected *current* gradient term alongside the usual
-        # bias-corrected momentum, instead of using momentum alone.
-        m_hat = beta1 * (m / (1.0 - beta1 ** (i + 2))) + (1.0 - beta1) * grad / (
-            1.0 - beta1 ** (i + 1)
-        )
+        # Plain bias-corrected Adam momentum -- not the NAdam-blended
+        # numerator (m_hat mixing in a bias-corrected *current* gradient
+        # term) this briefly used. That blend directly injects each step's
+        # raw, unsmoothed gradient into the step numerator; under multiple
+        # *mandatory* objectives that genuinely conflict (e.g. a Reach
+        # Target fighting a Zero Rotation and a Prefer Current Pose
+        # regularizer, all folded into one combined mandatory loss), the
+        # gradient itself oscillates near the resulting trade-off
+        # equilibrium, and NAdam's numerator inherited that oscillation
+        # directly -- measured as a ~10x larger end-effector position
+        # spread under a tiny warm-start perturbation, and visibly jittery
+        # solves frame-to-frame in the Blender add-on's Live/Bake usage.
+        # Plain momentum smooths that noise out instead of amplifying it.
+        # See paper_evaluation/ik_jax_lib_bench_jitter.py.
+        m_hat = m / (1.0 - beta1 ** (i + 1))
         v_hat = v / (1.0 - beta2 ** (i + 1))
 
-        # Cautious optimizer modification
-        # Create mask where the NAdam-blended numerator and gradient have same sign
-        mask = (m_hat * grad > 0).astype(grad.dtype)
+        # Cautious optimizer modification: mask where momentum and gradient
+        # have the same sign -- forced open for the first _MASK_WARMUP
+        # steps (see its definition above), since momentum starts at zero
+        # and hasn't warmed up enough yet for that agreement test to mean
+        # much.
+        cautious_mask = (m_hat * grad > 0).astype(grad.dtype)
+        mask = jnp.where(i < _MASK_WARMUP, jnp.ones_like(grad), cautious_mask)
 
         # Apply cautious mask to the normalized gradient
         denom = jnp.sqrt(v_hat) + epsilon
