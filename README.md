@@ -26,7 +26,7 @@ Real-time inverse kinematics in pure JAX with differentiable objectives, traject
 
 Version 0.4 of the Jax-IK library now outperforms all other tested IK libraries, both in speed and success rate:
 
-![compare_table.png](paper_evaluation/compare_table.png)
+![compare_table.png](paper_evaluation/compare_table_smplx_fingers.png)
 
 
 
