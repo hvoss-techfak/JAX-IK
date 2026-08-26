@@ -24,6 +24,10 @@ Real-time inverse kinematics in pure JAX with differentiable objectives, traject
 - Simple forward kinematics (FK) API, plus helpers to deform meshes (LBS or rigid) for visualization
 - Clean CLI for quick experiments and interactive PyVista rendering
 
+Version 0.4 of the Jax-IK library now outperforms all other tested IK libraries, both in speed and success rate:
+
+![compare_table.png](paper_evaluation/compare_table.png)
+
 
 
 ## Installation
